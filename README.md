@@ -1,3 +1,5 @@
+# This repo is a fork from CausalDynamics 
+
 # CausalDynamics: A large-scale benchmark for structural discovery of dynamical causal models
 
 <div align="center">
@@ -37,38 +39,21 @@ python process_causaldynamics.py
 ```
 
 ## Installation
-### Using pip
+### Using poetry
 
-*CausalDynamics* is available on [PyPi](https://pypi.org/project/causaldynamics/), so you can use pip to install `causaldynamics`, which currently requires Python version `3.10`.
+1. Configure poetry (one time command)
 
 ```bash
-pip install causaldynamics
+poetry config virtualenvs.in-project true --local
 ```
 
-If you use conda, please use the following commands: 
-```shell
-conda create --name venv python=3.10
-conda activate venv
-pip install causaldynamics
+1. Create Environment & Install
+
+```bash
+python3 -m venv {your_env_name}
+source env_emulator_climatem/bin/activate
+poetry install
 ```
-
-### Using pdm
-Clone the repository and install it using [pdm](https://pdm-project.org/en/latest/): 
-
-```shell
-git clone https://github.com/kausable/CausalDynamics.git
-cd CausalDynamics
-pdm install
-```
-
-You can test whether the installation succeded by creating some coupled causal model data:
-
-```shell
-$(pdm venv activate)
-python src/causaldynamics/creator.py --config config.yaml
-```
-
-You find the output at `output/<timestamp>` as default location.
 
 
 ## Getting Started
