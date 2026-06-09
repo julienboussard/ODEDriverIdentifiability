@@ -31,6 +31,9 @@ dependencies = [
     "qgs>=1.0.0",
     "sparse<=0.15.5",
     "netcdf4>=1.7.2",
+    "ipykernel (>=7.2.0,<8.0.0)",
+    "fpcmci (>=4.4.1,<5.0.0)",
+    "lingam (>=1.12.1,<2.0.0)",
 ]
 requires-python = ">=3.10, <3.11"
 readme = "README.md"

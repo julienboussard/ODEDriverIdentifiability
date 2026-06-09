@@ -1,4 +1,4 @@
-from causallearn.search.HiddenCausal.GIN.GIN import GIN as CL_GIN
+# from causallearn.search.HiddenCausal.GIN.GIN import GIN as CL_GIN
 
 class GIN:
     """

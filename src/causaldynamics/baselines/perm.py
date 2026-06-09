@@ -1,4 +1,4 @@
-from causallearn.search.PermutationBased.GRaSP import grasp as CL_GRASP
+# from causallearn.search.PermutationBased.GRaSP import grasp as CL_GRASP
 
 class GRASP:
     """

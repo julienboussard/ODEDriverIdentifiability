@@ -9,16 +9,16 @@ import xarray as xr
 from tqdm import tqdm
 
 from causaldynamics.baselines import (
-    DYNOTEARS,
-    FPCMCI,
+    # DYNOTEARS,
+    # FPCMCI,
     NGC_LSTM,
     TSCI,
     CUTSPlus,
     PCMCIPlus,
     VARLiNGAM,
-    RCD,
-    GIN,
-    GRASP, 
+    # RCD,
+    # GIN,
+    # GRASP, 
     TCDF
 )
 from causaldynamics.creator import logger
@@ -31,9 +31,9 @@ from jsonargparse import ArgumentParser
 
 CAUSAL_MODELS = [
     "pcmciplus",
-    "fpcmci",
+    # "fpcmci",
     "varlingam",
-    "dynotears",
+    # "dynotears",
     "ngc_lstm",
     "tsci",
     "cutsplus",
@@ -81,7 +81,7 @@ def evaluate(*, data_dir: str):
         "pcmciplus": PCMCIPlus(),
         "fpcmci": FPCMCI(),
         "varlingam": VARLiNGAM(),
-        "dynotears": DYNOTEARS(),
+        # "dynotears": DYNOTEARS(),
         "ngc_lstm": NGC_LSTM(),
         "tsci": TSCI(),
         "cutsplus": CUTSPlus(),

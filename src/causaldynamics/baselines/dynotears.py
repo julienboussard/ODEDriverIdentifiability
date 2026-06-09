@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from causalnex.structure import dynotears
+# from causalnex.structure import dynotears
 
 
 class DYNOTEARS:

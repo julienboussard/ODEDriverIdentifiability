@@ -1,10 +1,10 @@
-import fpcmci
+# import fpcmci
 import tigramite
-from fpcmci.basics.utils import LabelType
-from fpcmci.CPrinter import CPLevel
-from fpcmci.FPCMCI import FPCMCI
-from fpcmci.preprocessing.data import Data
-from fpcmci.selection_methods.TE import TE, TEestimator
+# from fpcmci.basics.utils import LabelType
+# from fpcmci.CPrinter import CPLevel
+# from fpcmci.FPCMCI import FPCMCI
+# from fpcmci.preprocessing.data import Data
+# from fpcmci.selection_methods.TE import TE, TEestimator
 from tigramite import data_processing as pp
 from tigramite.independence_tests.parcorr import ParCorr
 from tigramite.pcmci import PCMCI

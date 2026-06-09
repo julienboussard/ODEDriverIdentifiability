@@ -10,8 +10,8 @@ import xarray as xr
 from tqdm import tqdm
 
 from causaldynamics.baselines import (
-    DYNOTEARS,
-    FPCMCI,
+    # DYNOTEARS,
+    # FPCMCI,
     NGC_LSTM,
     TSCI,
     CUTSPlus,
@@ -69,14 +69,14 @@ def ablate(*, exp_dir: str, abl_type: str):
     # your causal models
     causal_models = {
         "pcmciplus": PCMCIPlus(),
-        "fpcmci":    FPCMCI(),
+        # "fpcmci":    FPCMCI(),
         "varlingam": VARLiNGAM(),
-        "dynotears": DYNOTEARS(),
+        # "dynotears": DYNOTEARS(),
         "ngc_lstm":  NGC_LSTM(),
         "tsci":      TSCI(),
         "cutsplus":  CUTSPlus(),
-        "rcd":       RCD(),
-        "grasp":     GRASP(),
+        # "rcd":       RCD(),
+        # "grasp":     GRASP(),
         "tcdf":      TCDF(),
     }
 

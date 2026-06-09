@@ -1,33 +1,29 @@
 """
-Structured Dynamical Model
+Structured ODE modelling
 ===========================
 Predicts the last timestep from a window of T timesteps:
  
-    X_hat[-1] = f( flatten( X @ S @ W @ S.T ) )
+    X_hat[-1] = f( flatten( X @ W ) )
  
 where
     X  : (T, N)     input window  (full history)
-    S  : (N, K)     soft cluster assignment, softmax over rows
-    W  : (T, K, K)  per-timestep cluster interaction matrices
-    S.T: (K, N)
+    W  : (T, N, N)  per-timestep causal driver matrices
  
 Step by step:
-    z1 = X @ S          (T, N) @ (N, K)  -> (T, K)   project to cluster space
-    z2 = z1 @ W         (T, K) x (T,K,K) -> (T, K)   per-timestep cluster mixing
-    z3 = z2 @ S.T       (T, K) @ (K, N)  -> (T, N)   project back to variable space
-    out = f(z3.flatten())  (T*N,) -> (N,)             predict X[-1]
+    z1 = X * W          (T, N) @ (T, N, N)  -> (T, N, N)  
+    out = f_n(z1.flatten())  (T*N, N) -> (,N)             predict X_t+1 - X_t
  
 Constraints
 -----------
-- S  : softmax rows  →  each variable soft-assigned to one cluster
-- W  : L1 sparsity + NOTEARS acyclicity on W[-1] only
-- S  : entropy regularisation  →  push toward hard (one-hot) assignments
+- W  : L0 sparsity 
+- Lipschitz function / gradient penalty
 """
  
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
+from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 import math
 import numpy as np
@@ -46,7 +42,7 @@ class MLP(nn.Module):
         layers = []
         d = in_dim
         for _ in range(n_layers):
-            layers += [nn.Linear(d, hidden_dim), nn.Tanh()]
+            layers += [nn.Linear(d, hidden_dim), nn.Tanh()] # Here, needed to have a non constant function i.e. derivative is not 0
             d = hidden_dim
         layers += [nn.Linear(d, out_dim)]
         self.net = nn.Sequential(*layers)
@@ -100,7 +96,6 @@ class StructuredDynamics(nn.Module):
     Parameters
     ----------
     n          : number of variables N
-    k          : number of clusters K  (K << N)
     t          : context window length T
     device     : device to run the model on
     hidden_dim : hidden size for f MLP
@@ -109,56 +104,27 @@ class StructuredDynamics(nn.Module):
  
     def __init__(self,
                  n: int,
-                 k: int,
                  t: int,
-                 device,
-                 instantaneous: bool = False,
                  hidden_dim: int = 64,
                  n_layers: int = 3,
                  L_lipschitz: float = 2.0, 
-                 is_lipschitz: bool = False, 
-                 M_mask: torch.Tensor | None = None):
+                 is_lipschitz: bool = False,
+                 ):
         super().__init__()
         self.n = n
-        self.k = k
         self.t = t
-        self.instantaneous = instantaneous
         self.is_lipschitz = is_lipschitz
         # ── Structural parameters ─────────────────────────────────────────────
  
-        # S: cluster assignment logits (N, K)
-        # softmax over dim=-1: each variable's row is a prob. dist. over clusters
-        if k > 1:
-            self.log_S = nn.Parameter(torch.randn(n, k) * 0.1) #.to(device)
-            self.W_logits = nn.Parameter(torch.ones((t+1), k, k) * 3) #.to(device)
-        else:
-            self.log_S =torch.ones((n, k), requires_grad=False).to(device)  # if K=1, all variables in one cluster, no need to learn it
-            self.W_logits = torch.ones(((t+1), k, k), requires_grad = False).to(device) * 3
-
-        self.M_logits = nn.Parameter(torch.ones((t+1), n, n) * 3) #.to(device)
+        self.M_logits = nn.Parameter(torch.ones(t, n, n) * 3)
         
-        # Hard mask for M: initialized to all ones, gets progressively sparsified
-        self.register_buffer('M_mask', M_mask if M_mask is not None else torch.ones((t+1, n, n)))
-        
- 
         # W: per-timestep cluster interactions (T, K, K)
         # acyclicity enforced on W[-1] only; L1 sparsity on all T slices
 #         print(torch.sigmoid(self.M_logits))
 
-        # f: flattened (T*N,) -> (N,)
-        if self.is_lipschitz:
-            self.f_lagged = nn.ModuleList(LipschitzNet(in_dim=t * n, out_dim=1,
-                        hidden_dim=hidden_dim, n_layers=n_layers, L=L_lipschitz) for _ in range(n))
-            if instantaneous:
-                self.f_instantaneous = LipschitzNet(in_dim=n, out_dim=n,
-                            hidden_dim=hidden_dim, n_layers=n_layers, L=L_lipschitz)
-        else:
-            self.f_lagged = nn.ModuleList(MLP(in_dim=t * n, out_dim=1,
-                        hidden_dim=hidden_dim, n_layers=n_layers) for _ in range(n))
-            if instantaneous:
-                self.f_instantaneous = MLP(in_dim=n, out_dim=n,
-                            hidden_dim=hidden_dim, n_layers=n_layers)
-    
+        self.f = nn.ModuleList(LipschitzNet(in_dim=t * n, out_dim=1,
+                    hidden_dim=hidden_dim, n_layers=n_layers, L=L_lipschitz) for _ in range(n))
+
     # ── Forward pass ──────────────────────────────────────────────────────────
  
     def forward(self, X: torch.Tensor, ste_th: float) -> torch.Tensor:
@@ -178,72 +144,28 @@ class StructuredDynamics(nn.Module):
         if single:
             X = X.unsqueeze(0)              # (1, T, N)
 
-        if self.k > 1:
-        
-            S =  F.softmax(self.log_S) # TODO check this Here specify that it should be over the right ones? 
-            # Parametrize with hard softmax here as well? Or orthonormality constraint as in PICABU? 
-
-            z1 = X @ S
-            # Step 2 — per-timestep cluster mixing
-            # einsum: z2[b,t,:] = z1[b,t,:] @ W[t,:,:]
-            # (B, T, K) x (T, K, K)  ->  (B, T, K)
-            
-            #TODO: clarify: is this K*K i.e. one more dimension
-            W = torch.sigmoid(self.W_logits)
-            z2 = torch.einsum("btk, tkj -> btj", z1, W[:-1])
-    
-            # Step 3 — project back to variable space
-            # (B, T, K) @ (K, N)  ->  (B, T, N)
-            z3 = z2 @ S.T
-            
-            M_soft = torch.sigmoid(self.M_logits)
-            M_hard = (M_soft > ste_th).float()
-            M = M_soft + (M_hard - M_soft).detach()
-
-            # M = torch.sigmoid(self.M_logits) * self.M_mask
-            #TODO: clarify: is this K*K i.e. one more dimension --> proper ,mask
-            z4 = torch.einsum("btk, tkj -> btkj", z3, M[:-1]) # elementwise mask to sparsify the full T*N space
-        else:
-            # This for Straight through estimator 
-            # M_soft = torch.sigmoid(self.M_logits)
-            # M_hard = (M_soft > ste_th).float()
-            # M = M_soft + (M_hard - M_soft).detach()
-
-            # This for for sigmoid parameterization
-            # M = torch.sigmoid(self.M_logits) * self.M_mask
-
-            # This for hard concrete distrinution i.e. L0 regularization 
-            M = sample_hard_concrete(self.M_logits)
-            z4 = torch.einsum("btk, tkj -> btkj", X, M[:-1])
+        # This for hard concrete distrinution i.e. L0 regularization 
+        M = sample_hard_concrete(self.M_logits)
+        # z = torch.einsum("btk, tkj -> btkj", X, M)
+        z = X.unsqueeze(-1) * M.unsqueeze(0)
 
         # Step 4 — flatten N*N and predict X[-1]
         # (B, T, N*N)  ->  (B, N)
         out = []
         for i in range(self.n):
-            out.append(self.f_lagged[i](z4[:, :, :, i].flatten(start_dim=1)))
+            out.append(self.f[i](z[:, :, :, i].flatten(start_dim=1)))
         out = torch.stack(out, dim=-1) # (B, N)
-
-            
-        if self.instantaneous:
-            z5 = torch.einsum("bk, kj -> bkj", out, M[-1]) # residual connection from input to output of masked space
-            out =  out + self.f_instantaneous(z5.flatten(start_dim=1))
                 
         return out.squeeze(0) if single else out
  
  
-    @torch.no_grad()
-    def hard_assignment(self) -> torch.LongTensor:
-        """Hard cluster label for each variable via argmax. Shape: (N,)."""
-        return F.softmax(self.log_S).argmax(dim=-1)
- 
 
-class StructuredLowRankDiscovery():
+class StructuredODEDiscovery():
 
-    def __init__(self, n: int, k: int, t: int, device, instantaneous: bool = False, hidden_dim: int = 8, n_layers: int = 2, L_lipschitz: float = 2.0, is_lipschitz: bool = False, normalize: bool = True):
+    def __init__(self, n: int, t: int, device, instantaneous: bool = False, hidden_dim: int = 8, n_layers: int = 2, L_lipschitz: float = 2.0, is_lipschitz: bool = False, normalize: bool = True):
 
         self.t = t
         self.n = n
-        self.k = k
         self.device = device
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers    
@@ -252,7 +174,6 @@ class StructuredLowRankDiscovery():
         self.L_lipschitz = L_lipschitz
         self.normalize = normalize
 
-
     # ─────────────────────────────────────────────────────────────────────────────
     # Loss
     # ─────────────────────────────────────────────────────────────────────────────
@@ -260,10 +181,6 @@ class StructuredLowRankDiscovery():
     def loss_fn(self,
                 X_windows: torch.Tensor,
                 X_target: torch.Tensor,
-                lambda_dag: float = 1.0,
-                mu_dag: float = 1.0,
-                lambda_s: float = 0.01,
-                lambda_w: float = 0.01,
                 lambda_m: float = 0.01,
                 lambda_grad: float = 0.01,
                 bool_sparse: bool = False, 
@@ -308,31 +225,14 @@ class StructuredLowRankDiscovery():
             if l0_l1_l2 == "l0":
                 m_sparse = hard_concrete_sparsity(self.model.M_logits)
             else:
-                if self.instantaneous:
-                    m_sparse = torch.sigmoid(self.model.M_logits) 
-                else:
-                    m_sparse = torch.sigmoid(self.model.M_logits[:-1]) 
+                m_sparse = torch.sigmoid(self.model.M_logits) 
                 if l0_l1_l2 == "l1":
                     m_sparse = m_sparse.sum()
                 elif l0_l1_l2 == "l2":
                     m_sparse = (m_sparse ** 2).sum()
 
-
             # To change to have two parameters
             total += lambda_m * m_sparse / self.model.n**2
-
-            if self.model.k > 1:
-
-                # 2. W sparsity — L1 over all T slices
-                w_sparse = torch.sigmoid(self.model.W_logits).sum()
-                # 3. DAG acyclicity on W[-1] only  (augmented Lagrangian) + S entropy — push rows toward one-hot
-                h   = acyclicity(torch.sigmoid(self.model.W_logits)[-1])     
-                dag = lambda_dag * h + (mu_dag / 2) * h ** 2
-                
-                S = F.softmax(self.model.log_S)
-
-                entropy = -(S * (S + 1e-8).log()).sum(dim=-1).mean() # Not needed if we use hard concrete distribution over the rows of S
-                total += lambda_w * w_sparse  / self.model.k**2 + dag + lambda_s * entropy
         
             # Gradient penalty — gradient norm should be <= L (Lipschitz)
             grad_norm = input_grads.view(input_grads.shape[0], -1).norm(2, dim=1)
@@ -340,33 +240,17 @@ class StructuredLowRankDiscovery():
             gradient_penalty = (grad_norm ** 2).mean()
             total = total + lambda_grad * gradient_penalty
 
-        if self.model.k > 1 and bool_sparse:
+        # print(gradient_penalty)
+
+        if bool_sparse:
             return total, {
                 "recon":    recon,
-                "last_hw": h.item(),
-                "dag":      dag.item(),
-                "entropy":  entropy.item(),
-                "w_sparse": w_sparse.item(),
-                "m_sparse": m_sparse.item(),
-                "gradient_penalty": gradient_penalty.item()
-            }
-        elif bool_sparse:
-            return total, {
-                "recon":    recon,
-                "last_hw": 0.0,
-                "dag":      0.0,
-                "entropy":  0.0,
-                "w_sparse": 0.0,
                 "m_sparse": m_sparse.item(),
                 "gradient_penalty": gradient_penalty.item()
             }
         else:
             return total, {
                 "recon":    recon,
-                "last_hw": 0.0,
-                "dag":      0.0,
-                "entropy":  0.0,
-                "w_sparse": 0.0,
                 "m_sparse": 0.0,
                 "gradient_penalty": 0.0
             }
@@ -403,7 +287,7 @@ class StructuredLowRankDiscovery():
         indices = list(range(0, len(history), max(1, M)))
         xs = [xs[i] for i in indices]
 
-        keys = ["total", "recon", "dag", "entropy", "w_sparse", "m_sparse", "gradient_penalty"] #"gradient_penalty"
+        keys = ["total", "recon", "m_sparse", "gradient_penalty"] #"gradient_penalty"
         available = [k for k in keys if any(k in entry for entry in history)]
         if not available:
             raise ValueError("history entries must contain at least one loss component")
@@ -433,25 +317,19 @@ class StructuredLowRankDiscovery():
 
     def run(self,
             X: torch.Tensor,
-            n_outer: int = 50,
-            n_inner: int = 200,
-            sindy_alternate_optim: bool = False,
+            n_inner: int = 10_000,
             lr: float = 1e-3,
-            mu_init: float = 0.0001,
-            mu_factor: float = 1.1,
-            lambda_dag_init: float = 0.0,
             l0_l1_l2: str = "l0",
-            h_tol: float = 1e-4,
-            lambda_s: float = 0.01,
-            lambda_w: float = 0.01,
             lambda_m: float = 0.01,
             lambda_grad: float = 0.01,
             batch_size: int | None = None,
             n_inner_min_sparse: int = 500, # before sparsification
             th: float = 0.5, 
             patience: int = 50,
-            plot_frequency: int = 10,
-            return_history: bool = False,) -> tuple[StructuredDynamics, torch.Tensor] | tuple[StructuredDynamics, torch.Tensor, list[dict]]:
+            plot_frequency: int = 500,
+            return_history: bool = False,
+            save_fig_path: str | None = None
+            ) -> tuple[StructuredDynamics, torch.Tensor] | tuple[StructuredDynamics, torch.Tensor, list[dict]]:
         """
         Fit the model to a time series X of shape (T, N).
     
@@ -478,21 +356,21 @@ class StructuredLowRankDiscovery():
         """
         # Build sliding training windows (B, T, N) and targets (B, N)
 
-        print(f"Dimensions: N={self.n}, K={self.k}, T={self.t}")
+        print(f"Dimensions: N={self.n}, T={self.t}")
 
         assert l0_l1_l2 in ["l0", "l1", "l2"], "l0_l1_l2 must be 'l0', 'l1', or 'l2'"
         assert self.n == X.shape[-1], f"Model n={self.n} must match data N={X.shape[-1]}"
         if X.dim() != 3:
             raise ValueError("X must be a 3D tensor with shape (B, T, N) for training")
 
-        print(f"Number of NaN values in X: {np.any(np.isnan(X.detach().cpu().numpy())).sum()}")
+        print(f"Number of NaN values in X: {torch.isnan(X).any()}")
 
         if self.normalize:
             X = X - X.mean(dim=0, keepdim=True)
             X = X / (X.std(dim=0, keepdim=True) + 1e-8) # Small fix
 
-        print(f"Number of NaN values after normalization in X: {np.any(np.isnan(X.detach().cpu().numpy())).sum()}")
-        print(f"Constant dimensions in X: {np.where(X[:, 0].detach().cpu().numpy().std(axis=0) == 0)}")
+        print(f"Number of NaN values after normalization in X: {torch.isnan(X).any()}")
+        print(f"Constant dimensions in X: {torch.where(X[:, 0].std(dim=0) == 0)}")
 
         if self.t == 0:
             X_t_all = X
@@ -507,6 +385,9 @@ class StructuredLowRankDiscovery():
             X_t_all = torch.stack([X[i : i + self.t] for i in range(X.shape[0] - self.t)], dim=0)
             X_last_all = X[self.t:] - X[self.t - 1 : -1] if self.instantaneous else X[self.t:]
 
+        X_t_all   = X_t_all.to(self.device)
+        X_last_all = X_last_all.to(self.device)
+
         n_samples = X_t_all.shape[0]
         if n_samples == 0:
             raise ValueError("No training samples could be constructed from X and the chosen window length t")
@@ -518,158 +399,93 @@ class StructuredLowRankDiscovery():
 
         batch_size = min(batch_size, n_samples)
 
-        lambda_dag = lambda_dag_init
-        mu_dag = mu_init
-    
-        M_mask = torch.ones((self.t + 1, self.n, self.n), device=self.device)
+        self.model = StructuredDynamics(n=self.n, t=self.t, hidden_dim=self.hidden_dim, n_layers=self.n_layers, L_lipschitz=self.L_lipschitz, is_lipschitz=self.is_lipschitz).to(self.device)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+        # Prepare a DataLoader to avoid Python-side indexing/permutation overhead
+        dataset = TensorDataset(X_t_all, X_last_all)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        iter = 0
+        best_loss = float('inf')
+        no_improve_steps = 0
         history: list[dict] = []
-        current_loss = float('nan')
 
-        if not sindy_alternate_optim:
-            n_outer = 1  # if not alternating, just do one outer loop with fixed lambda and mu
+        while iter < n_inner:
 
-        outer = 0
-        while outer < n_outer:
-            # print the different values of info
-            # recon_list = []
-            # dag_list = []
-            # entropy_list = []
-            # w_sparse_list = []
+            bool_sparse = iter >= n_inner_min_sparse 
+            gradient_penalty_all = 0
 
-            self.model = StructuredDynamics(n=self.n, k=self.k, t=self.t, device=self.device, hidden_dim=self.hidden_dim, n_layers=self.n_layers, L_lipschitz=self.L_lipschitz, is_lipschitz=self.is_lipschitz, M_mask=M_mask).to(self.device)
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+            recon_all = 0
+            loss_all = 0
+            m_sparse_all = 0
 
-            iter = 0
-            best_loss = float('inf')
-            no_improve_steps = 0
+            n_batches = 0
+            for X_t, X_last in loader:
+                n_batches += 1
 
-            while iter < n_inner:
+                # ensure X_t requires grad for gradient-penalty computation
+                X_t = X_t.detach().requires_grad_(True)
 
-                perm = torch.randperm(n_samples, device=X_t_all.device)
-                bool_sparse = iter >= n_inner_min_sparse 
-                gradient_penalty_all = 0
+                optimizer.zero_grad()
 
-                recon_all = 0
-                loss_all = 0
-                last_hw_all = 0
-                dag_all = 0
-                entropy_all = 0
-                w_sparse_all = 0
-                m_sparse_all = 0
+                loss, info = self.loss_fn(X_t, X_last,
+                                    ste_th=th,
+                                    lambda_m=lambda_m,
+                                    lambda_grad=lambda_grad,
+                                    bool_sparse=bool_sparse, 
+                                    l0_l1_l2=l0_l1_l2
+                )
 
-                n_batches = 0
-                for batch_start in range(0, n_samples, batch_size):
-                    n_batches += 1
-                    idx   = perm[batch_start : batch_start + batch_size]
-                    
-                    X_t   = X_t_all[idx].detach().requires_grad_(True)
-                    X_last = X_last_all[idx] #.squeeze(1)
+                gradient_penalty_all += info["gradient_penalty"]
+                recon_all += info["recon"]
+                loss_all += loss.item()
+                m_sparse_all += info["m_sparse"]
 
-                    optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-                    loss, info = self.loss_fn(X_t, X_last,
-                                        ste_th=th,
-                                        lambda_dag=lambda_dag,
-                                        mu_dag=mu_dag,
-                                        lambda_s=lambda_s,
-                                        lambda_w=lambda_w,
-                                        lambda_m=lambda_m,
-                                        lambda_grad=lambda_grad,
-                                        bool_sparse=bool_sparse, 
-                                        l0_l1_l2=l0_l1_l2
-                    )
+            history.append({
+                "inner": iter + 1,
+                "step": iter + 1,
+                "total": loss_all / n_batches,
+                "recon":    recon_all / n_batches,
+                "m_sparse": lambda_m * m_sparse_all / n_batches / self.model.n**2,
+                "gradient_penalty": lambda_grad * gradient_penalty_all / n_batches
+            })
 
-                    gradient_penalty_all += info["gradient_penalty"]
-                    recon_all += info["recon"]
-                    loss_all += loss.item()
-                    last_hw_all += info["last_hw"]
-                    dag_all += info["dag"]
-                    entropy_all += info["entropy"]          
-                    w_sparse_all += info["w_sparse"]
-                    m_sparse_all += info["m_sparse"]
+            if plot_frequency > 0 and (iter + 1) % plot_frequency == 0:
+                self.plot_loss_components(history, M=1, save_path=save_fig_path)
 
-
-                    loss.backward()
-                    # Clip gradients — A is N×N and can have large raw gradients
-    #                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    optimizer.step()
-
-                history.append({
-                    "outer": outer + 1,
-                    "inner": iter + 1,
-                    "step": outer * n_inner + iter + 1,
-                    "total": loss_all / n_batches,
-                    "recon":    recon_all / n_batches,
-                    "last_hw": last_hw_all / n_batches,
-                    "dag":      dag_all / n_batches,
-                    "entropy":  lambda_s *entropy_all / n_batches,
-                    "w_sparse": lambda_w * w_sparse_all / n_batches / self.model.k**2,
-                    "m_sparse": lambda_m * m_sparse_all / n_batches / self.model.n**2,
-                    "gradient_penalty": lambda_grad * gradient_penalty_all / n_batches
-                })
-
-                if plot_frequency > 0 and (iter + 1) % plot_frequency == 0:
-                    self.plot_loss_components(history, M=1)
-
-                if bool_sparse:
-                    # We start checking for convergence after we start sparsifying
-                    if loss_all / n_batches < best_loss:
-                        best_loss = loss_all / n_batches
-                        no_improve_steps = 0
-                    else:
-                        no_improve_steps += 1
-                        if no_improve_steps >= patience:
-                            print(f"  → stopping inner loop at step {iter} after {no_improve_steps} no-improve steps (best={best_loss:.6f}, current={(loss_all / n_batches):.6f})")
-                            break
-                iter += 1
-    
-            h_val = info["last_hw"]
-            
-            print(f"outer={outer+1:02d}  h(W)={(last_hw_all / n_batches):.5f}  "
-                f"recon={(recon_all / n_batches):.4f}  "
-                f"entropy={(entropy_all / n_batches):.3f}  "
-                f"|W|_1={(w_sparse_all / n_batches):.3f}  "
-                f"|M|_1={(m_sparse_all / n_batches):.3f}  "
-                f"lambda={lambda_dag:.3f}  mu={mu_dag:.2f}")
-            
             if bool_sparse:
-                # Progressive sparsification: zero out M coefficients below threshold
-                with torch.no_grad():
-                    M = torch.sigmoid(self.model.M_logits)
-                    # Find coefficients that should be masked (currently active but below threshold)
-                    currently_active = M_mask > th
-                    below_th = M < th
-                    to_mask = currently_active & below_th
-                    n_zeroed = to_mask.sum().item()
-                    
-                    if n_zeroed > 0:
-                        # Update the mask to zero out these coefficients
-                        M_mask[to_mask] = 0.0
-                        print(f"M_mask {M_mask[0]}")
-                    else:
-                        # No more coefficients below threshold, convergence reached
-                        print(f"→ Sparsification converged: no coefficients below threshold={th}")
+                # We start checking for convergence after we start sparsifying
+                if loss_all / n_batches < best_loss:
+                    best_loss = loss_all / n_batches
+                    no_improve_steps = 0
+                else:
+                    no_improve_steps += 1
+                    if no_improve_steps >= patience:
+                        print(f"  → stopping inner loop at step {iter} after {no_improve_steps} no-improve steps (best={best_loss:.6f}, current={(loss_all / n_batches):.6f})")
                         break
+            iter += 1
 
-            if self.instantaneous and self.k > 1:
-                # Updates for the augmented Lagrangian: increase lambda and mu for the DAG constraint on W[-1]
-                # Not used in causaldynamics - we learn the Jacobian of the system
-                with torch.no_grad():
-                    lambda_dag += mu_dag * acyclicity(torch.sigmoid(self.model.W_logits[-1])).item()
-                mu_dag *= mu_factor
-            
-            outer += 1
+        
+        print(f"recon={(recon_all / n_batches):.4f}  "
+            f"|M|_1={(m_sparse_all / n_batches):.3f}  "
+            f"grad_penalty={(gradient_penalty_all / n_batches):.4f}  ")
 
+        self.plot_loss_components(history, M=1, save_path=save_fig_path)
 
         if return_history:
-            return self.model, M_mask, history
+            return self.model, torch.sigmoid(self.model.M_logits)
 
-        return self.model, M_mask #.transpose(2, 1) # Should we transpose here? a priori no
+        return self.model, torch.sigmoid(self.model.M_logits) #.transpose(2, 1) # Should we transpose here? a priori no
     
     
 def sample_hard_concrete(log_alpha, beta=0.33, zeta=-0.1, gamma=1.1):
     # During training: sample
-    u = torch.zeros_like(log_alpha).uniform_().clamp(1e-8, 1 - 1e-8)
+    # Use rand_like which is slightly faster and stays on the same device/dtype
+    u = torch.rand_like(log_alpha).clamp(1e-8, 1 - 1e-8)
     s = torch.sigmoid((torch.log(u) - torch.log(1 - u) + log_alpha) / beta)
     z_bar = s * (gamma - zeta) + zeta   # stretch to [zeta, gamma] = [-0.1, 1.1]
     z = z_bar.clamp(0, 1)               # hard clamp → exact 0s and 1s

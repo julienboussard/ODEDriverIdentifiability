@@ -9,8 +9,8 @@ import xarray as xr
 from tqdm import tqdm
 
 from causaldynamics.baselines import (
-    DYNOTEARS,
-    FPCMCI,
+    # DYNOTEARS,
+    # FPCMCI,
     NGC_LSTM,
     TSCI,
     CUTSPlus,
@@ -38,13 +38,13 @@ param_grids = {
             "pc_alpha": [0.01, 0.05, 0.1],
         }
     },
-    "FPCMCI": {
-        "model_cls": FPCMCI,
-        "grid": {
-            "pc_alpha": [0.01, 0.05, 0.1],
-            "f_alpha":  [0.01, 0.05, 0.1],
-        }
-    },
+    # "FPCMCI": {
+    #     "model_cls": FPCMCI,
+    #     "grid": {
+    #         "pc_alpha": [0.01, 0.05, 0.1],
+    #         "f_alpha":  [0.01, 0.05, 0.1],
+    #     }
+    # },
     "RCD": {
         "model_cls": RCD,
         "grid": {
@@ -66,13 +66,13 @@ param_grids = {
             "corr_thres":  [0.7, 0.8, 0.9],
         }
     },
-    "DYNOTEARS": {
-        "model_cls": DYNOTEARS,
-        "grid": {
-            "lambda_w":  [0.1, 0.2, 0.3],
-            "lambda_a":  [0.1, 0.2, 0.3],
-        }
-    },
+    # "DYNOTEARS": {
+    #     "model_cls": DYNOTEARS,
+    #     "grid": {
+    #         "lambda_w":  [0.1, 0.2, 0.3],
+    #         "lambda_a":  [0.1, 0.2, 0.3],
+    #     }
+    # },
     "NGC_LSTM": {
         "model_cls": NGC_LSTM,
         "grid": {
