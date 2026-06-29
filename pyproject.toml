@@ -34,6 +34,7 @@ dependencies = [
     "ipykernel (>=7.2.0,<8.0.0)",
     "fpcmci (>=4.4.1,<5.0.0)",
     "lingam (>=1.12.1,<2.0.0)",
+    "cooper-optim>=1.0.1",
 ]
 requires-python = ">=3.10, <3.11"
 readme = "README.md"
@@ -75,6 +76,9 @@ causalnex = ["causalnex @ git+https://github.com/mckinsey/causalnex.git@develop"
 [tool.flake8]
 ignore = ['E203']
 max-line-length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.black]
 line-length = 88

@@ -28,6 +28,42 @@ import matplotlib.pyplot as plt
 import math
 import numpy as np
 
+import cooper
+
+PENALTY_FORMULATION = "penalty"
+AUGMENTED_LAGRANGIAN_FORMULATION = "augmented_lagrangian"
+CONSTRAINT_NAMES = ("sparsity", "lipschitz")
+CONSTRAINT_FORMULATIONS = {PENALTY_FORMULATION, AUGMENTED_LAGRANGIAN_FORMULATION}
+
+
+def _resolve_constraint_formulations(
+    constraint_formulation: str | dict[str, str],
+) -> dict[str, str]:
+    """
+    Check and resolve the constraint formulation(s) for sparsity and Lipschitz constraints.
+    """
+    if isinstance(constraint_formulation, str):
+        formulations = {name: constraint_formulation for name in CONSTRAINT_NAMES}
+    else:
+        unknown = set(constraint_formulation) - set(CONSTRAINT_NAMES)
+        if unknown:
+            raise ValueError(
+                f"Unknown constraints {sorted(unknown)}. "
+                f"Expected only {CONSTRAINT_NAMES}."
+            )
+        formulations = {
+            name: constraint_formulation.get(name, PENALTY_FORMULATION)
+            for name in CONSTRAINT_NAMES
+        }
+    invalid = set(formulations.values()) - CONSTRAINT_FORMULATIONS
+    if invalid:
+        raise ValueError(
+            f"Unknown constraint formulations {sorted(invalid)}. "
+            f"Use '{PENALTY_FORMULATION}' or '{AUGMENTED_LAGRANGIAN_FORMULATION}'."
+        )
+    return formulations
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MLP  (shared over full N-dim vector)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +119,88 @@ def acyclicity(W: torch.Tensor) -> torch.Tensor:
     Operates on the K×K matrix W (cheap since K << N).
     """
     return torch.trace(torch.matrix_exp(W * W)) - W.shape[0]
+
+
+class ODEConstrainedProblem(cooper.ConstrainedMinimizationProblem):
+    """Cooper CMP for the ODE model's sparsity and Lipschitz constraints."""
+
+    def __init__(
+        self,
+        discovery: "StructuredODEDiscovery",
+        constraint_formulations: dict[str, str],
+        lambda_m_init: float,
+        lambda_grad_init: float,
+        sparsity_budget: float,
+    ):
+        super().__init__()
+        self.discovery = discovery
+        self.constraint_formulations = constraint_formulations
+        self.sparsity_budget = sparsity_budget
+
+        self.sparsity_constraint = self._build_constraint(
+            formulation=constraint_formulations["sparsity"],
+            coefficient=lambda_m_init,
+        )
+        self.lipschitz_constraint = self._build_constraint(
+            formulation=constraint_formulations["lipschitz"],
+            coefficient=lambda_grad_init,
+        )
+
+    def _build_constraint(self, formulation: str, coefficient: float) -> cooper.Constraint:
+        device = self.discovery.device
+        min_coefficient = 1e-8 if formulation == AUGMENTED_LAGRANGIAN_FORMULATION else 0.0
+        penalty_coefficient = cooper.penalty_coefficients.DensePenaltyCoefficient(
+            init=torch.tensor(max(float(coefficient), min_coefficient), device=device)
+        )
+        if formulation == AUGMENTED_LAGRANGIAN_FORMULATION:
+            multiplier = cooper.multipliers.DenseMultiplier(
+                num_constraints=1, device=device
+            )
+            return cooper.Constraint(
+                constraint_type=cooper.ConstraintType.INEQUALITY,
+                formulation_type=cooper.formulations.AugmentedLagrangian,
+                multiplier=multiplier,
+                penalty_coefficient=penalty_coefficient,
+            )
+        return cooper.Constraint(
+            constraint_type=cooper.ConstraintType.INEQUALITY,
+            formulation_type=cooper.formulations.QuadraticPenalty,
+            penalty_coefficient=penalty_coefficient,
+        )
+
+    def compute_cmp_state(
+        self,
+        X_windows: torch.Tensor,
+        X_target: torch.Tensor,
+        bool_sparse: bool,
+        l0_l1_l2: str,
+        ste_th: float,
+    ) -> cooper.CMPState:
+        objective, info, violations = (
+            self.discovery.objective_and_constraint_state(
+                X_windows=X_windows,
+                X_target=X_target,
+                bool_sparse=bool_sparse,
+                l0_l1_l2=l0_l1_l2,
+                ste_th=ste_th,
+                sparsity_budget=self.sparsity_budget,
+            )
+        )
+        observed_constraints = {}
+        if violations["sparsity"] is not None:
+            observed_constraints[self.sparsity_constraint] = cooper.ConstraintState(
+                violation=violations["sparsity"]
+            )
+        if violations["lipschitz"] is not None:
+            observed_constraints[self.lipschitz_constraint] = cooper.ConstraintState(
+                violation=violations["lipschitz"]
+            )
+
+        return cooper.CMPState(
+            loss=objective, 
+            observed_constraints=observed_constraints, 
+            misc=info
+        )
  
  
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +238,7 @@ class StructuredDynamics(nn.Module):
         
         # W: per-timestep cluster interactions (T, K, K)
         # acyclicity enforced on W[-1] only; L1 sparsity on all T slices
-#         print(torch.sigmoid(self.M_logits))
+        # print(torch.sigmoid(self.M_logits))
 
         self.f = nn.ModuleList(LipschitzNet(in_dim=t * n, out_dim=1,
                     hidden_dim=hidden_dim, n_layers=n_layers, L=L_lipschitz) for _ in range(n))
@@ -177,83 +295,62 @@ class StructuredODEDiscovery():
     # ─────────────────────────────────────────────────────────────────────────────
     # Loss
     # ─────────────────────────────────────────────────────────────────────────────
-    
-    def loss_fn(self,
+
+    def objective_and_constraint_state(self,
                 X_windows: torch.Tensor,
                 X_target: torch.Tensor,
-                lambda_m: float = 0.01,
-                lambda_grad: float = 0.01,
-                bool_sparse: bool = False, 
-                l0_l1_l2: str = "l0", 
-                ste_th: float = 0.5) -> tuple[torch.Tensor, dict]:
+                bool_sparse: bool = False,
+                l0_l1_l2: str = "l0",
+                ste_th: float = 0.5,
+                sparsity_budget: float = 0.0) -> tuple[torch.Tensor, dict, dict[str, torch.Tensor | None]]:
         """
-        Total training loss.
-    
-        Terms
-        -----
-        1. Reconstruction  : MSE( X_hat[-1],  X_target )
-        2. DAG penalty     : augmented Lagrangian on h(W[-1])
-        3. S entropy       : pushes S toward hard (one-hot) assignments
-        4. W sparsity      : L1 on all T slices of W
-    
-        Parameters
-        ----------
-        X_windows : (batch, T, N)   input windows
-        X_target  : (batch, 1, N)      ground truth X at t (i.e. the next step)
-        lambda_dag : Lagrange multiplier for W[-1] acyclicity  (updated externally)
-        mu_dag     : quadratic penalty coefficient             (updated externally)
-        lambda_s   : entropy regularisation weight for S
-        lambda_w   : L1 weight for W
-        lambda_grad: gradient penalty weight
+        Objective plus optional Cooper constraint violations.
+
+        Sparsity and Lipschitzness are inequality violations, which can be either a
+        quadratic penalty or an augmented Lagrangian.
         """
         X_hat = self.model(X_windows, ste_th)                        # (batch, N)
-    
-        # 1. Reconstruction
+
         total = F.mse_loss(X_hat, X_target)
-
-        input_grads = torch.autograd.grad(
-            outputs=total,
-            inputs=X_hat,
-            create_graph=True,   # keeps the graph alive so we can backprop through this
-            retain_graph=True,   # keeps the graph alive for the final .backward()
-        )[0]
-
-
         recon = total.item()
 
+        zero = total.new_tensor(0.0)
+        m_sparse = zero
+        gradient_penalty = zero
+        grad_violation = None
+        sparsity_violation = None
+
         if bool_sparse:
+            input_grads = torch.autograd.grad(
+                outputs=total,
+                inputs=X_hat,
+                create_graph=True,
+                retain_graph=True,
+            )[0]
+
             if l0_l1_l2 == "l0":
                 m_sparse = hard_concrete_sparsity(self.model.M_logits)
             else:
-                m_sparse = torch.sigmoid(self.model.M_logits) 
+                m_sparse = torch.sigmoid(self.model.M_logits)
                 if l0_l1_l2 == "l1":
                     m_sparse = m_sparse.sum()
                 elif l0_l1_l2 == "l2":
                     m_sparse = (m_sparse ** 2).sum()
 
-            # To change to have two parameters
-            total += lambda_m * m_sparse / self.model.n**2
-        
-            # Gradient penalty — gradient norm should be <= L (Lipschitz)
+            sparsity_violation = m_sparse / self.model.n**2 - sparsity_budget
+
             grad_norm = input_grads.view(input_grads.shape[0], -1).norm(2, dim=1)
-            # gradient_penalty = (torch.clamp(grad_norm - self.L_lipschitz, min=0) ** 2).mean()
             gradient_penalty = (grad_norm ** 2).mean()
-            total = total + lambda_grad * gradient_penalty
+            grad_violation = grad_norm.mean() - self.L_lipschitz
 
-        # print(gradient_penalty)
-
-        if bool_sparse:
-            return total, {
-                "recon":    recon,
-                "m_sparse": m_sparse.item(),
-                "gradient_penalty": gradient_penalty.item()
-            }
-        else:
-            return total, {
-                "recon":    recon,
-                "m_sparse": 0.0,
-                "gradient_penalty": 0.0
-            }
+        return total, {
+            "recon": recon,
+            "m_sparse": m_sparse.item(),
+            "sparsity_violation": sparsity_violation.item() if sparsity_violation is not None else 0.0,
+            "gradient_penalty": gradient_penalty.item(),
+            "grad_violation": grad_violation.item() if grad_violation is not None else 0.0,
+            "constraint_penalty": 0.0,
+        }, {"sparsity": sparsity_violation, "lipschitz": grad_violation}
             
     def plot_loss_components(self,
                              history: list[dict],
@@ -287,7 +384,7 @@ class StructuredODEDiscovery():
         indices = list(range(0, len(history), max(1, M)))
         xs = [xs[i] for i in indices]
 
-        keys = ["total", "recon", "m_sparse", "gradient_penalty"] #"gradient_penalty"
+        keys = ["total", "recon", "m_sparse", "sparsity_violation", "gradient_penalty", "grad_violation", "constraint_penalty"]
         available = [k for k in keys if any(k in entry for entry in history)]
         if not available:
             raise ValueError("history entries must contain at least one loss component")
@@ -328,7 +425,10 @@ class StructuredODEDiscovery():
             patience: int = 50,
             plot_frequency: int = 500,
             return_history: bool = False,
-            save_fig_path: str | None = None
+            save_fig_path: str | None = None,
+            constraint_formulation: str | dict[str, str] = PENALTY_FORMULATION,
+            sparsity_budget: float = 0.0,
+            dual_lr: float | None = None,
             ) -> tuple[StructuredDynamics, torch.Tensor] | tuple[StructuredDynamics, torch.Tensor, list[dict]]:
         """
         Fit the model to a time series X of shape (T, N).
@@ -353,6 +453,12 @@ class StructuredODEDiscovery():
         batch_size : optional minibatch size for training
         th         : threshold for sparsifying M coefficients
         l0_l1_l2   : whether to use L0, L1, or L2 regularization for M
+        constraint_formulation : "penalty", "augmented_lagrangian", or a dict
+            mapping "sparsity" and "lipschitz" to either formulation. Missing
+            dict entries default to "penalty".
+        sparsity_budget : allowed normalized sparsity before the constraint is violated.
+        dual_lr : learning rate for Cooper's Lagrange multiplier optimizer.
+            Defaults to lr / 10.
         """
         # Build sliding training windows (B, T, N) and targets (B, N)
 
@@ -400,7 +506,33 @@ class StructuredODEDiscovery():
         batch_size = min(batch_size, n_samples)
 
         self.model = StructuredDynamics(n=self.n, t=self.t, hidden_dim=self.hidden_dim, n_layers=self.n_layers, L_lipschitz=self.L_lipschitz, is_lipschitz=self.is_lipschitz).to(self.device)
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        primal_optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        
+        constraint_formulations = _resolve_constraint_formulations(constraint_formulation)
+        
+        cooper_cmp = ODEConstrainedProblem(
+            discovery=self,
+            constraint_formulations=constraint_formulations,
+            lambda_m_init=lambda_m,
+            lambda_grad_init=lambda_grad,
+            sparsity_budget=sparsity_budget,
+        )
+        if AUGMENTED_LAGRANGIAN_FORMULATION in constraint_formulations.values():
+            if dual_lr is None:
+                dual_lr = lr / 10
+            dual_optimizer = torch.optim.SGD(
+                cooper_cmp.dual_parameters(), lr=dual_lr, maximize=True
+            )
+            cooper_optimizer = cooper.optim.SimultaneousOptimizer(
+                cmp=cooper_cmp,
+                primal_optimizers=primal_optimizer,
+                dual_optimizers=dual_optimizer,
+            )
+        else:
+            cooper_optimizer = cooper.optim.UnconstrainedOptimizer(
+                cmp=cooper_cmp,
+                primal_optimizers=primal_optimizer,
+            )
 
         # Prepare a DataLoader to avoid Python-side indexing/permutation overhead
         dataset = TensorDataset(X_t_all, X_last_all)
@@ -419,6 +551,9 @@ class StructuredODEDiscovery():
             recon_all = 0
             loss_all = 0
             m_sparse_all = 0
+            sparsity_violation_all = 0
+            grad_violation_all = 0
+            constraint_penalty_all = 0
 
             n_batches = 0
             for X_t, X_last in loader:
@@ -427,31 +562,39 @@ class StructuredODEDiscovery():
                 # ensure X_t requires grad for gradient-penalty computation
                 X_t = X_t.detach().requires_grad_(True)
 
-                optimizer.zero_grad()
-
-                loss, info = self.loss_fn(X_t, X_last,
-                                    ste_th=th,
-                                    lambda_m=lambda_m,
-                                    lambda_grad=lambda_grad,
-                                    bool_sparse=bool_sparse, 
-                                    l0_l1_l2=l0_l1_l2
+                roll_out = cooper_optimizer.roll(
+                    compute_cmp_state_kwargs={
+                        "X_windows": X_t,
+                        "X_target": X_last,
+                        "ste_th": th,
+                        "bool_sparse": bool_sparse,
+                        "l0_l1_l2": l0_l1_l2,
+                    }
+                )
+                loss = roll_out.primal_lagrangian_store.lagrangian
+                info = dict(roll_out.cmp_state.misc)
+                info["constraint_penalty"] = (
+                    loss.detach().item() - roll_out.loss.detach().item()
                 )
 
                 gradient_penalty_all += info["gradient_penalty"]
                 recon_all += info["recon"]
                 loss_all += loss.item()
                 m_sparse_all += info["m_sparse"]
-
-                loss.backward()
-                optimizer.step()
+                sparsity_violation_all += info["sparsity_violation"]
+                grad_violation_all += info["grad_violation"]
+                constraint_penalty_all += info["constraint_penalty"]
 
             history.append({
                 "inner": iter + 1,
                 "step": iter + 1,
                 "total": loss_all / n_batches,
                 "recon":    recon_all / n_batches,
-                "m_sparse": lambda_m * m_sparse_all / n_batches / self.model.n**2,
-                "gradient_penalty": lambda_grad * gradient_penalty_all / n_batches
+                "m_sparse": m_sparse_all / n_batches / self.model.n**2,
+                "sparsity_violation": sparsity_violation_all / n_batches,
+                "gradient_penalty": lambda_grad * gradient_penalty_all / n_batches,
+                "grad_violation": grad_violation_all / n_batches,
+                "constraint_penalty": constraint_penalty_all / n_batches
             })
 
             if plot_frequency > 0 and (iter + 1) % plot_frequency == 0:
@@ -477,7 +620,7 @@ class StructuredODEDiscovery():
         self.plot_loss_components(history, M=1, save_path=save_fig_path)
 
         if return_history:
-            return self.model, torch.sigmoid(self.model.M_logits)
+            return self.model, torch.sigmoid(self.model.M_logits), history
 
         return self.model, torch.sigmoid(self.model.M_logits) #.transpose(2, 1) # Should we transpose here? a priori no
     
