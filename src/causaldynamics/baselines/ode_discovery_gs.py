@@ -275,16 +275,55 @@ class StructuredDynamics(nn.Module):
         out = torch.stack(out, dim=-1) # (B, N)
                 
         return out.squeeze(0) if single else out
+
+    def infer(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Deterministic inference-time prediction.
+
+        Training samples hard-concrete gates; inference uses their clipped mean so
+        repeated predictions from a trained model are reproducible.
+        """
+        self.eval()
+        with torch.no_grad():
+            single = X.dim() == 2
+            if X.dim() == 1:
+                single = True
+                X = X.view(1, self.t, self.n)
+            elif single:
+                X = X.unsqueeze(0)
+
+            M = hard_concrete_mean(self.M_logits)
+            z = X.unsqueeze(-1) * M.unsqueeze(0)
+
+            out = []
+            for i in range(self.n):
+                out.append(self.f[i](z[:, :, :, i].flatten(start_dim=1)))
+            out = torch.stack(out, dim=-1)
+
+            return out.squeeze(0) if single else out
  
  
 
 class StructuredODEDiscovery():
 
-    def __init__(self, n: int, t: int, device, instantaneous: bool = False, hidden_dim: int = 8, n_layers: int = 2, L_lipschitz: float = 2.0, is_lipschitz: bool = False, normalize: bool = True):
+    def __init__(
+        self,
+        n: int,
+        t: int,
+        device,
+        coupled: bool | None = None,
+        instantaneous: bool = False,
+        hidden_dim: int = 8,
+        n_layers: int = 2,
+        L_lipschitz: float = 2.0,
+        is_lipschitz: bool = False,
+        normalize: bool = True,
+    ):
 
         self.t = t
         self.n = n
         self.device = device
+        self.coupled = coupled
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers    
         self.instantaneous = instantaneous
@@ -484,12 +523,20 @@ class StructuredODEDiscovery():
         elif self.t == 1:
             X_t_all = X[:-1]
             # Important to predict the difference and not the next step to avoid predicting identity
-            X_last_all = X[1:] - X[:-1]
+            X_last_all = X[1:] if self.coupled else X[1:] - X[:-1]
         else:
             if X.shape[0] <= self.t:
                 raise ValueError(f"Time series length T={X.shape[0]} must be larger than window length t={self.t}")
             X_t_all = torch.stack([X[i : i + self.t] for i in range(X.shape[0] - self.t)], dim=0)
-            X_last_all = X[self.t:] - X[self.t - 1 : -1] if self.instantaneous else X[self.t:]
+            if self.coupled is True:
+                X_last_all = X[self.t:]
+            elif self.coupled is False:
+                X_last_all = X[self.t:] - X[self.t - 1 : -1]
+            else:
+                X_last_all = X[self.t:] - X[self.t - 1 : -1] if self.instantaneous else X[self.t:]
+
+        if self.t > 1 and X_t_all.dim() == 4 and X_t_all.shape[2] == 1:
+            X_t_all = X_t_all.squeeze(2)
 
         X_t_all   = X_t_all.to(self.device)
         X_last_all = X_last_all.to(self.device)
