@@ -31,9 +31,10 @@ import numpy as np
 import cooper
 
 PENALTY_FORMULATION = "penalty"
+LAGRANGIAN_FORMULATION = "lagrangian"
 AUGMENTED_LAGRANGIAN_FORMULATION = "augmented_lagrangian"
 CONSTRAINT_NAMES = ("sparsity", "lipschitz")
-CONSTRAINT_FORMULATIONS = {PENALTY_FORMULATION, AUGMENTED_LAGRANGIAN_FORMULATION}
+CONSTRAINT_FORMULATIONS = {PENALTY_FORMULATION, LAGRANGIAN_FORMULATION, AUGMENTED_LAGRANGIAN_FORMULATION}
 
 
 def _resolve_constraint_formulations(
@@ -59,7 +60,7 @@ def _resolve_constraint_formulations(
     if invalid:
         raise ValueError(
             f"Unknown constraint formulations {sorted(invalid)}. "
-            f"Use '{PENALTY_FORMULATION}' or '{AUGMENTED_LAGRANGIAN_FORMULATION}'."
+            f"Use one of {sorted(CONSTRAINT_FORMULATIONS)}."
         )
     return formulations
 
@@ -131,11 +132,13 @@ class ODEConstrainedProblem(cooper.ConstrainedMinimizationProblem):
         lambda_m_init: float,
         lambda_grad_init: float,
         sparsity_budget: float,
+        lipschitz_budget: float | None = None,
     ):
         super().__init__()
         self.discovery = discovery
         self.constraint_formulations = constraint_formulations
         self.sparsity_budget = sparsity_budget
+        self.lipschitz_budget = lipschitz_budget
 
         self.sparsity_constraint = self._build_constraint(
             formulation=constraint_formulations["sparsity"],
@@ -148,6 +151,18 @@ class ODEConstrainedProblem(cooper.ConstrainedMinimizationProblem):
 
     def _build_constraint(self, formulation: str, coefficient: float) -> cooper.Constraint:
         device = self.discovery.device
+
+        if formulation == LAGRANGIAN_FORMULATION:
+            multiplier = cooper.multipliers.DenseMultiplier(
+                num_constraints=1,
+                init=torch.tensor([max(float(coefficient), 0.0)], device=device),
+            )
+            return cooper.Constraint(
+                constraint_type=cooper.ConstraintType.INEQUALITY,
+                formulation_type=cooper.formulations.Lagrangian,
+                multiplier=multiplier,
+            )
+
         min_coefficient = 1e-8 if formulation == AUGMENTED_LAGRANGIAN_FORMULATION else 0.0
         penalty_coefficient = cooper.penalty_coefficients.DensePenaltyCoefficient(
             init=torch.tensor(max(float(coefficient), min_coefficient), device=device)
@@ -184,6 +199,7 @@ class ODEConstrainedProblem(cooper.ConstrainedMinimizationProblem):
                 l0_l1_l2=l0_l1_l2,
                 ste_th=ste_th,
                 sparsity_budget=self.sparsity_budget,
+                lipschitz_budget=self.lipschitz_budget,
             )
         )
         observed_constraints = {}
@@ -341,13 +357,22 @@ class StructuredODEDiscovery():
                 bool_sparse: bool = False,
                 l0_l1_l2: str = "l0",
                 ste_th: float = 0.5,
-                sparsity_budget: float = 0.0) -> tuple[torch.Tensor, dict, dict[str, torch.Tensor | None]]:
+                sparsity_budget: float = 0.0,
+                lipschitz_budget: float | None = None) -> tuple[torch.Tensor, dict, dict[str, torch.Tensor | None]]:
         """
         Objective plus optional Cooper constraint violations.
 
-        Sparsity and Lipschitzness are inequality violations, which can be either a
-        quadratic penalty or an augmented Lagrangian.
+        Sparsity and Lipschitzness are inequality violations, fed to a quadratic
+        penalty, a classic Lagrangian, or an augmented Lagrangian.
+
+        sparsity_budget / lipschitz_budget are the allowed slack before each
+        constraint is violated.
         """
+        # None keeps backward compatibility: the gradient-norm bound was self.L_lipschitz
+        # before this argument existed. Pass 0.0 for the budget-free pre-Cooper penalty.
+        if lipschitz_budget is None:
+            lipschitz_budget = self.L_lipschitz
+
         X_hat = self.model(X_windows, ste_th)                        # (batch, N)
 
         total = F.mse_loss(X_hat, X_target)
@@ -378,9 +403,18 @@ class StructuredODEDiscovery():
 
             sparsity_violation = m_sparse / self.model.n**2 - sparsity_budget
 
+            # NOTE (matters for recovering the pre-Cooper implementation): the Cooper
+            # integration *redefined* the Lipschitz term. All formulations here constrain
+            # the mean gradient norm (linear in ||grad||), whereas the pre-Cooper code
+            # penalized the mean *squared* norm `mean(||grad||^2)` directly. `gradient_penalty`
+            # below still computes that old quantity, but it feeds only the logged history
+            # (scaled by lambda_grad) -- it does NOT enter the Lagrangian for ANY formulation.
+            # So `lagrangian` + frozen multiplier + lipschitz_budget=0 recovers only an
+            # analogous (mean-norm) Lipschitz penalty, not the old squared-norm one. Revert
+            # grad_violation to `(grad_norm ** 2).mean()` if a byte-for-byte match is needed.
             grad_norm = input_grads.view(input_grads.shape[0], -1).norm(2, dim=1)
             gradient_penalty = (grad_norm ** 2).mean()
-            grad_violation = grad_norm.mean() - self.L_lipschitz
+            grad_violation = grad_norm.mean() - lipschitz_budget
 
         return total, {
             "recon": recon,
@@ -467,6 +501,7 @@ class StructuredODEDiscovery():
             save_fig_path: str | None = None,
             constraint_formulation: str | dict[str, str] = PENALTY_FORMULATION,
             sparsity_budget: float = 0.0,
+            lipschitz_budget: float | None = None,
             dual_lr: float | None = None,
             ) -> tuple[StructuredDynamics, torch.Tensor] | tuple[StructuredDynamics, torch.Tensor, list[dict]]:
         """
@@ -492,12 +527,16 @@ class StructuredODEDiscovery():
         batch_size : optional minibatch size for training
         th         : threshold for sparsifying M coefficients
         l0_l1_l2   : whether to use L0, L1, or L2 regularization for M
-        constraint_formulation : "penalty", "augmented_lagrangian", or a dict
-            mapping "sparsity" and "lipschitz" to either formulation. Missing
-            dict entries default to "penalty".
-        sparsity_budget : allowed normalized sparsity before the constraint is violated.
-        dual_lr : learning rate for Cooper's Lagrange multiplier optimizer.
-            Defaults to lr / 10.
+        constraint_formulation : "penalty", "lagrangian", "augmented_lagrangian", or a
+            dict mapping "sparsity" and "lipschitz" to one of these. Missing dict
+            entries default to "penalty".
+        sparsity_budget : allowed normalized sparsity slack before the constraint is
+            violated (sparsity_violation = m_sparse / n^2 - sparsity_budget).
+        lipschitz_budget : allowed mean-gradient-norm slack before the Lipschitz
+            constraint is violated (grad_violation = mean(||grad||) - lipschitz_budget).
+        dual_lr : learning rate for Cooper's Lagrange multiplier (dual) optimizer, used by
+            the "lagrangian" and "augmented_lagrangian" formulations. Defaults to lr / 10.
+            Set to 0.0 to freeze the multipliers at their initial values.
         """
         # Build sliding training windows (B, T, N) and targets (B, N)
 
@@ -563,10 +602,17 @@ class StructuredODEDiscovery():
             lambda_m_init=lambda_m,
             lambda_grad_init=lambda_grad,
             sparsity_budget=sparsity_budget,
+            lipschitz_budget=lipschitz_budget,
         )
-        if AUGMENTED_LAGRANGIAN_FORMULATION in constraint_formulations.values():
+        # Both the classic and the augmented Lagrangian carry dual variables (the
+        # multipliers), so they need a dual optimizer and a constrained (primal-dual)
+        # optimizer. The quadratic penalty has no dual variables and uses the
+        # unconstrained optimizer.
+        dual_formulations = {LAGRANGIAN_FORMULATION, AUGMENTED_LAGRANGIAN_FORMULATION}
+        if dual_formulations & set(constraint_formulations.values()):
             if dual_lr is None:
                 dual_lr = lr / 10
+            # dual_lr=0 freezes the multipliers at their initial values.
             dual_optimizer = torch.optim.SGD(
                 cooper_cmp.dual_parameters(), lr=dual_lr, maximize=True
             )
