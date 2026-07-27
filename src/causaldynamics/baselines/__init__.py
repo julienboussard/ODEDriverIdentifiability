@@ -10,4 +10,4 @@ from .tcdf import TCDF
 from .picabu import PICABU
 from .structured_lowrank_discovery import StructuredLowRankDiscovery
 from .ode_discovery_gs import StructuredODEDiscovery
-
+from .ode_discovery_node import StructuredNODEDiscovery

@@ -34,6 +34,7 @@ dependencies = [
     "ipykernel (>=7.2.0,<8.0.0)",
     "fpcmci (>=4.4.1,<5.0.0)",
     "lingam (>=1.12.1,<2.0.0)",
+    "torchdiffeq (>=0.2.5,<0.3.0)",
 ]
 requires-python = ">=3.10, <3.11"
 readme = "README.md"

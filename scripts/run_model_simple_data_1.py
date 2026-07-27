@@ -1,29 +1,9 @@
-import copy
-import math
 import os
 import numpy as np
 import xarray as xr
 import glob
 
-from causaldynamics.scm import create_scm_graph
-from causaldynamics.plot import plot_scm
 from causaldynamics.score import score
-
-from causaldynamics.baselines import PCMCIPlus
-from causaldynamics.baselines import FPCMCI
-from causaldynamics.baselines import DYNOTEARS
-from causaldynamics.baselines import VARLiNGAM
-from causaldynamics.baselines import NGC_LSTM
-from causaldynamics.baselines import TSCI
-from causaldynamics.baselines import CUTSPlus
-# from causaldynamics.baselines import RCD
-# from causaldynamics.baselines import GIN
-# from causaldynamics.baselines import GRASP
-from causaldynamics.baselines import TCDF
-
-# DYNOTEARS / FPCMCI + not sure about PCMCIPlus + VARLiNGAM
-
-from tqdm import tqdm
 from pathlib import Path
 import torch
 
@@ -32,11 +12,11 @@ warnings.filterwarnings('ignore')
 
 import matplotlib.pyplot as plt 
 
-from causaldynamics.baselines import PICABU, StructuredODEDiscovery
+from causaldynamics.baselines import StructuredODEDiscovery
 
 
 tau_max = 1 # i.e. no delay 
-hyperparam_search_array = np.array([0.01, 0.05, 0.1]) #0.001, 0.005
+hyperparam_search_array = np.array([0.0001, 0.0005, 0.001])
 model_name = "ode_sparse_discovery"
 
 # Hyperparameters to do search over: lambda_m only?
@@ -50,7 +30,7 @@ if __name__ == "__main__":
 
     assert device.type == "cuda", "CUDA is not available. Please check your PyTorch installation and GPU configuration."
 
-    for noise in [0.00, 0.50, 1.00, 1.50, 2.00]:
+    for noise in [0.00, 2.00]:
         for confounder in [False, True]:
             print(f"Running for noise {noise}, confounder {confounder}")
 
@@ -62,7 +42,7 @@ if __name__ == "__main__":
 
             print(f"doing hyperparameter search on lorenz84, noise={noise}, confounder={confounder}")
             
-            # NOT DOING HYPERPARAM SEARCH
+            # NOT DOING HYPERPARAM SEARCH, WAS ALREADY DONE, JUST RUNNING WITH BEST HYPERPARAM ON ALL DATASETS
             # hp_search_dataset = "Lorenz84_N10_T1000"
             # ds = xr.open_dataset(data_dir_noise / f"{hp_search_dataset}.nc")
 
@@ -143,12 +123,18 @@ if __name__ == "__main__":
 
             # final_lambda_m = hyperparam_search_array[argmax]
 
-            final_lambda_m = 0.001
+            final_lambda_m = 0.05
 
             all_files = glob.glob(str(data_dir_noise / "*.nc"))
             for file in all_files[:10]: # Just run on first 10 datasets
                 name_system = file.split("/")[-1]
                 name_psmodel = name_system.split(".")[0]
+
+                name_save_results = eval_dir_noise / f'results_test_{name_psmodel}.npz'
+                # if name_save_results.exists():
+                #     print(f"Results already exist for {name_system}, skipping...")
+                #     continue
+
                 print(f"Running method on {name_system}")
                 name_eval =   eval_dir_noise / name_system
 
@@ -162,33 +148,45 @@ if __name__ == "__main__":
 
                 is_any_nan = np.any(np.isnan(timeseries))
 
+                bool_nonans = False
                 lowrank_adj_matrix = []
                 for j, x in enumerate(timeseries[:, :, None]):
+                    if np.isnan(x).any():
+                        print(f"Skipping timeseries {j} due to NaN values")
+                        continue
+                    bool_nonans = True
                     lowrank_model = StructuredODEDiscovery(
+                        coupled=False,
                         t = tau_max,
                         n = N,
                         L_lipschitz = 1, 
                         is_lipschitz = False,
-                        hidden_dim = 32, 
-                        n_layers = 3,
+                        hidden_dim = 8, 
+                        n_layers = 2,
                         device = device,
+                        beta_init = 0.33, 
+                        beta_min = 0.33,
+                        annealing_rate = 0.95,
+                        annealing_epochs = 10,
+                        normalize_grad = True,
                     )
-                    trained_model, mask = lowrank_model.run(X=torch.tensor(x).to(device), l0_l1_l2='l0', th=0.5, lr=0.001, lambda_grad=100, lambda_m = final_lambda_m, n_inner_min_sparse = 100, batch_size=32, n_inner=4_000, patience = 200, save_fig_path = eval_dir_noise / f"loss_components_{name_psmodel}_{j}.png")
+                    trained_model, mask = lowrank_model.run(n_samples=3, lambda_grad=100, X=torch.tensor(x).to(device), l0_l1_l2='l0', th=0.5, lr=0.001, lambda_m = 0.025, n_inner_min_sparse = 100, batch_size=128, n_inner=4_000, patience = 200, save_fig_path="couple_005_loss.png")
                     lowrank_adj_matrix.append(mask.detach().cpu().numpy())
 
-                results_scores = score(
-                    preds= np.array(lowrank_adj_matrix)[:, 0], #.transpose((0, 2, 1)), # Need to transpose
-                    labs= adj_matrix,
-                    name=model_name
-                )
+                if bool_nonans:
+                    results_scores = score(
+                        preds= np.array(lowrank_adj_matrix)[:, 0], #.transpose((0, 2, 1)), # Need to transpose
+                        labs= adj_matrix,
+                        name=model_name
+                    )
 
-                results_dict = {}
-                results_dict["joint_shd"] = results_scores.loc["Joint SHD", model_name]
-                results_dict["joint_auroc"] = results_scores.loc["Joint AUROC", model_name]
-                results_dict["joint_auprc"] = results_scores.loc["Joint AUPRC", model_name]
-                results_dict["any_nans"] = is_any_nan
+                    results_dict = {}
+                    results_dict["joint_shd"] = results_scores.loc["Joint SHD", model_name]
+                    results_dict["joint_auroc"] = results_scores.loc["Joint AUROC", model_name]
+                    results_dict["joint_auprc"] = results_scores.loc["Joint AUPRC", model_name]
+                    results_dict["any_nans"] = is_any_nan
 
-                np.savez(eval_dir_noise / f'results_test_{name_psmodel}.npz', **results_dict)
+                    np.savez(eval_dir_noise / f'results_test_{name_psmodel}.npz', **results_dict)
 
     print("Done")
 

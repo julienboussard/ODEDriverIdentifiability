@@ -108,7 +108,7 @@ class StructuredDynamics(nn.Module):
                  hidden_dim: int = 64,
                  n_layers: int = 3,
                  L_lipschitz: float = 2.0, 
-                 is_lipschitz: bool = True,
+                 is_lipschitz: bool = False,
                  ):
         super().__init__()
         self.n = n
@@ -116,27 +116,18 @@ class StructuredDynamics(nn.Module):
         self.is_lipschitz = is_lipschitz
         # ── Structural parameters ─────────────────────────────────────────────
  
-        self.M_logits = nn.Parameter(torch.ones(t, n, n) * 2)
-        # self.M_logits = nn.Parameter(torch.empty((t, n, n)))
-        # nn.init.normal_(self.M_logits, mean=2.0, std=0.01)
-
+        self.M_logits = nn.Parameter(torch.ones(t, n, n) * 3)
+        
         # W: per-timestep cluster interactions (T, K, K)
         # acyclicity enforced on W[-1] only; L1 sparsity on all T slices
 #         print(torch.sigmoid(self.M_logits))
 
-        if self.is_lipschitz:
-            self.f = nn.ModuleList(LipschitzNet(in_dim=t * n, out_dim=1,
-                        hidden_dim=hidden_dim, n_layers=n_layers, L=L_lipschitz) for _ in range(n))
-        else:
-            self.f = nn.ModuleList(MLP(in_dim=t * n, out_dim=1,
-                        hidden_dim=hidden_dim, n_layers=n_layers) for _ in range(n))
-
-        self.bn_2d = nn.BatchNorm1d(num_features=t * n * n)
-
+        self.f = nn.ModuleList(LipschitzNet(in_dim=t * n, out_dim=1,
+                    hidden_dim=hidden_dim, n_layers=n_layers, L=L_lipschitz) for _ in range(n))
 
     # ── Forward pass ──────────────────────────────────────────────────────────
  
-    def forward(self, X: torch.Tensor, beta: float = 0.33, n_samples: int = 1) -> torch.Tensor:
+    def forward(self, X: torch.Tensor, ste_th: float) -> torch.Tensor:
         """
         Predict X_{t+1} from X_t.
  
@@ -144,104 +135,44 @@ class StructuredDynamics(nn.Module):
         ----------
         X_t : (batch, N) or (N,)
         X_t1 : (batch, N) or (N,)
-        beta : hard-concrete temperature parameter used for sampling
-        n_samples : number of hard-concrete samples to draw and average over
  
         Returns
         -------
-        X_t1_hat : same shape as X_t for n_samples=1, otherwise a tensor of shape
-            (n_samples, batch, N) or (n_samples, N) for single inputs.
+        X_t1_hat : same shape as X_t
         """
-        if n_samples < 1:
-            raise ValueError("n_samples must be at least 1")
-
         single = X.dim() == 2
         if single:
             X = X.unsqueeze(0)              # (1, T, N)
 
-        sample_outputs = []
-        for _ in range(n_samples):
-            # This for hard concrete distribution i.e. L0 regularization
-            M = sample_hard_concrete(self.M_logits, beta=beta)
-            z = X.unsqueeze(-1) * M.unsqueeze(0)
+        # This for hard concrete distrinution i.e. L0 regularization 
+        M = sample_hard_concrete(self.M_logits)
+        # z = torch.einsum("btk, tkj -> btkj", X, M)
+        z = X.unsqueeze(-1) * M.unsqueeze(0)
 
-            z = self.bn_2d(z.flatten(start_dim=1)).reshape_as(z)
-
-            # Step 4 — flatten N*N and predict X[-1]
-            # (B, T, N*N)  ->  (B, N)
-            out = []
-            for i in range(self.n):
-                out.append(self.f[i](z[:, :, :, i].flatten(start_dim=1)))
-            out = torch.stack(out, dim=-1)  # (B, N)
-            sample_outputs.append(out)
-
-        outputs = torch.stack(sample_outputs, dim=0)  # (n_samples, B, N)
-
-        if single:
-            if n_samples == 1:
-                return outputs[0, 0]
-            return outputs[:, 0]
-        if n_samples == 1:
-            return outputs[0]
-        return outputs
-    
-    def infer(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Inference-time prediction with deterministic causal structure (no sampling).
-        
-        Uses hard_concrete_mean instead of sampling for reproducible predictions.
-        Disables gradients for efficiency.
-        
-        Parameters
-        ----------
-        X : (batch, T, N) or (T, N)
-            Input window of shape (batch, context_length, num_variables) or (context_length, num_variables)
-        
-        Returns
-        -------
-        X_hat : (batch, N) or (N,)
-            Predicted next step, same shape as input minus time dimension
-        """
-        self.eval()
-        with torch.no_grad():
-            single = X.dim() == 2
-            if single:
-                X = X.unsqueeze(0)              # (1, T, N)
-
-            # Use deterministic mean instead of sampling
-            M = hard_concrete_mean(self.M_logits)
-            z = X.unsqueeze(-1) * M.unsqueeze(0)
-
-            # Predict X[-1]: (B, T, N*N) -> (B, N)
-            out = []
-            for i in range(self.n):
-                out.append(self.f[i](z[:, :, :, i].flatten(start_dim=1)))
-            out = torch.stack(out, dim=-1)  # (B, N)
-
-            return out.squeeze(0) if single else out
+        # Step 4 — flatten N*N and predict X[-1]
+        # (B, T, N*N)  ->  (B, N)
+        out = []
+        for i in range(self.n):
+            out.append(self.f[i](z[:, :, :, i].flatten(start_dim=1)))
+        out = torch.stack(out, dim=-1) # (B, N)
+                
+        return out.squeeze(0) if single else out
  
  
 
 class StructuredODEDiscovery():
 
-    def __init__(self, n: int, t: int, device, coupled=True, instantaneous: bool = False, hidden_dim: int = 8, n_layers: int = 2, L_lipschitz: float = 2.0, is_lipschitz: bool = True, normalize: bool = True, normalize_grad: bool = False, beta_init: float = 2, beta_min: float = 0.5, annealing_rate: float = 0.95, annealing_epochs: int = 20):
+    def __init__(self, n: int, t: int, device, instantaneous: bool = False, hidden_dim: int = 8, n_layers: int = 2, L_lipschitz: float = 2.0, is_lipschitz: bool = False, normalize: bool = True):
 
         self.t = t
         self.n = n
         self.device = device
-        self.coupled = coupled
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers    
         self.instantaneous = instantaneous
         self.is_lipschitz = is_lipschitz
         self.L_lipschitz = L_lipschitz
         self.normalize = normalize
-        self.beta_init = beta_init
-        self.beta = max(beta_init, beta_min)
-        self.beta_min = beta_min
-        self.annealing_rate = annealing_rate
-        self.annealing_epochs = max(1, annealing_epochs)
-        self.normalize_grad = normalize_grad
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Loss
@@ -253,10 +184,8 @@ class StructuredODEDiscovery():
                 lambda_m: float = 0.01,
                 lambda_grad: float = 0.01,
                 bool_sparse: bool = False, 
-                l0_l1_l2: str = "l0",
-                beta: float = 0.33,
-                n_samples: int = 1,
-            ) -> tuple[torch.Tensor, dict]:
+                l0_l1_l2: str = "l0", 
+                ste_th: float = 0.5) -> tuple[torch.Tensor, dict]:
         """
         Total training loss.
     
@@ -277,34 +206,24 @@ class StructuredODEDiscovery():
         lambda_w   : L1 weight for W
         lambda_grad: gradient penalty weight
         """
-        X_hat = self.model(X_windows, beta=beta, n_samples=n_samples)
+        X_hat = self.model(X_windows, ste_th)                        # (batch, N)
+    
+        # 1. Reconstruction
+        total = F.mse_loss(X_hat, X_target)
 
-        # Average the reconstruction loss over all sampled hard-concrete masks.
-        if X_hat.dim() == 3 and X_hat.shape[0] == n_samples:
-            sample_losses = [F.mse_loss(X_hat[i], X_target) for i in range(n_samples)]
-            total = torch.stack(sample_losses).mean()
-            input_grads = torch.autograd.grad(
-                outputs=total,
-                inputs=X_hat,
-                create_graph=True,
-                retain_graph=True,
-            )[0]
-        else:
-            # 1. Reconstruction
-            total = F.mse_loss(X_hat, X_target)
-            input_grads = torch.autograd.grad(
-                outputs=total,
-                inputs=X_hat,
-                create_graph=True,   # keeps the graph alive so we can backprop through this
-                retain_graph=True,   # keeps the graph alive for the final .backward()
-            )[0]
+        input_grads = torch.autograd.grad(
+            outputs=total,
+            inputs=X_hat,
+            create_graph=True,   # keeps the graph alive so we can backprop through this
+            retain_graph=True,   # keeps the graph alive for the final .backward()
+        )[0]
 
 
         recon = total.item()
 
         if bool_sparse:
             if l0_l1_l2 == "l0":
-                m_sparse = hard_concrete_sparsity(self.model.M_logits, beta=beta)
+                m_sparse = hard_concrete_sparsity(self.model.M_logits)
             else:
                 m_sparse = torch.sigmoid(self.model.M_logits) 
                 if l0_l1_l2 == "l1":
@@ -313,10 +232,7 @@ class StructuredODEDiscovery():
                     m_sparse = (m_sparse ** 2).sum()
 
             # To change to have two parameters
-            if self.model.t > 0:
-                total += lambda_m * m_sparse / (self.model.n**2 * self.model.t)
-            else:
-                total += lambda_m * m_sparse / (self.model.n**2)
+            total += lambda_m * m_sparse / self.model.n**2
         
             # Gradient penalty — gradient norm should be <= L (Lipschitz)
             grad_norm = input_grads.view(input_grads.shape[0], -1).norm(2, dim=1)
@@ -405,10 +321,9 @@ class StructuredODEDiscovery():
             lr: float = 1e-3,
             l0_l1_l2: str = "l0",
             lambda_m: float = 0.01,
-            lambda_grad: float = 10,
+            lambda_grad: float = 0.01,
             batch_size: int | None = None,
-            n_samples: int = 3,
-            n_inner_min_sparse: int = 0, # before sparsification
+            n_inner_min_sparse: int = 500, # before sparsification
             th: float = 0.5, 
             patience: int = 50,
             plot_frequency: int = 500,
@@ -445,10 +360,8 @@ class StructuredODEDiscovery():
 
         assert l0_l1_l2 in ["l0", "l1", "l2"], "l0_l1_l2 must be 'l0', 'l1', or 'l2'"
         assert self.n == X.shape[-1], f"Model n={self.n} must match data N={X.shape[-1]}"
-        assert n_samples >= 1, "n_samples must be at least 1"
-        # if self.t == 1: 
         if X.dim() != 3:
-            raise ValueError("X must be a 3D tensor with shape (B, T, N) for training (T=1)")
+            raise ValueError("X must be a 3D tensor with shape (B, T, N) for training")
 
         print(f"Number of NaN values in X: {torch.isnan(X).any()}")
 
@@ -459,70 +372,35 @@ class StructuredODEDiscovery():
         print(f"Number of NaN values after normalization in X: {torch.isnan(X).any()}")
         print(f"Constant dimensions in X: {torch.where(X[:, 0].std(dim=0) == 0)}")
 
-        if not self.coupled:
-            if self.t == 0:
-                X_t_all = X
-                X_last_all = X
-            elif self.t == 1:
-                X_t_all = X[:-1]
-                # Important to predict the difference and not the next step to avoid predicting identity
-                X_last_all = X[1:] - X[:-1]
-            else:
-                if X.shape[0] <= self.t:
-                    raise ValueError(f"Time series length T={X.shape[0]} must be larger than window length t={self.t}")
-                X_t_all = torch.stack([X[i : i + self.t] for i in range(X.shape[0] - self.t)], dim=0)
-                X_last_all = X[self.t:] - X[self.t - 1 : -1]
-            if self.t > 1:
-                X_t_all = X_t_all.squeeze(2)
+        if self.t == 0:
+            X_t_all = X
+            X_last_all = X
+        elif self.t == 1:
+            X_t_all = X[:-1]
+            # Important to predict the difference and not the next step to avoid predicting identity
+            X_last_all = X[1:] - X[:-1]
         else:
-            if self.t == 0:
-                X_t_all = X
-                X_last_all = X
-            elif self.t == 1:
-                X_t_all = X[:-1]
-                # Important to predict the difference and not the next step to avoid predicting identity
-                X_last_all = X[1:]
-            else:
-                if X.shape[0] <= self.t:
-                    raise ValueError(f"Time series length T={X.shape[0]} must be larger than window length t={self.t}")
-                X_t_all = torch.stack([X[i : i + self.t] for i in range(X.shape[0] - self.t)], dim=0)
-                X_last_all = X[self.t:]
-            if self.t > 1:
-                X_t_all = X_t_all.squeeze(2)
-
-        print("X_t_all.shape:", X_t_all.shape)
-        print("X_last_all.shape:", X_last_all.shape)
-
-        if self.normalize_grad:
-            std_grad = X_last_all.std((0, 1))
-            std_grad[std_grad < 1e-6] = 1.0
-            X_last_all -= X_last_all.mean((0, 1))
-            X_last_all = X_last_all / std_grad
+            if X.shape[0] <= self.t:
+                raise ValueError(f"Time series length T={X.shape[0]} must be larger than window length t={self.t}")
+            X_t_all = torch.stack([X[i : i + self.t] for i in range(X.shape[0] - self.t)], dim=0)
+            X_last_all = X[self.t:] - X[self.t - 1 : -1] if self.instantaneous else X[self.t:]
 
         X_t_all   = X_t_all.to(self.device)
         X_last_all = X_last_all.to(self.device)
 
-        n_dataset_samples = X_t_all.shape[0]
-        if n_dataset_samples == 0:
+        n_samples = X_t_all.shape[0]
+        if n_samples == 0:
             raise ValueError("No training samples could be constructed from X and the chosen window length t")
 
         if batch_size is None:
-            batch_size = n_dataset_samples
+            batch_size = n_samples
         elif batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
 
-        batch_size = min(batch_size, n_dataset_samples)
+        batch_size = min(batch_size, n_samples)
 
         self.model = StructuredDynamics(n=self.n, t=self.t, hidden_dim=self.hidden_dim, n_layers=self.n_layers, L_lipschitz=self.L_lipschitz, is_lipschitz=self.is_lipschitz).to(self.device)
-        # optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-
-        gate_params = [p for name, p in self.model.named_parameters() if "M_logits" in name]
-        other_params = [p for name, p in self.model.named_parameters() if "M_logits" not in name]
-
-        optimizer = torch.optim.Adam([
-            {"params": other_params, "lr": lr},
-            {"params": gate_params,  "lr": 10 * lr, "betas": (0.9, 0.98)}, #, "betas": (0.9, 0.98)  # higher lr??, lower beta2
-        ])
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
         # Prepare a DataLoader to avoid Python-side indexing/permutation overhead
         dataset = TensorDataset(X_t_all, X_last_all)
@@ -543,8 +421,6 @@ class StructuredODEDiscovery():
             m_sparse_all = 0
 
             n_batches = 0
-            current_beta = self.beta
-
             for X_t, X_last in loader:
                 n_batches += 1
 
@@ -554,13 +430,11 @@ class StructuredODEDiscovery():
                 optimizer.zero_grad()
 
                 loss, info = self.loss_fn(X_t, X_last,
-                                    # ste_th=th,
+                                    ste_th=th,
                                     lambda_m=lambda_m,
                                     lambda_grad=lambda_grad,
                                     bool_sparse=bool_sparse, 
-                                    l0_l1_l2=l0_l1_l2,
-                                    beta=current_beta,
-                                    n_samples=n_samples,
+                                    l0_l1_l2=l0_l1_l2
                 )
 
                 gradient_penalty_all += info["gradient_penalty"]
@@ -576,25 +450,19 @@ class StructuredODEDiscovery():
                 "step": iter + 1,
                 "total": loss_all / n_batches,
                 "recon":    recon_all / n_batches,
-                "m_sparse": lambda_m * m_sparse_all / n_batches / (self.model.n**2 * self.model.t) if self.model.t > 0 else lambda_m * m_sparse_all / n_batches / (self.model.n**2),
+                "m_sparse": lambda_m * m_sparse_all / n_batches / self.model.n**2,
                 "gradient_penalty": lambda_grad * gradient_penalty_all / n_batches
             })
 
             if plot_frequency > 0 and (iter + 1) % plot_frequency == 0:
-                # print("Plotting loss components at iter ", iter + 1)
                 self.plot_loss_components(history, M=1, save_path=save_fig_path)
-
-            if self.annealing_epochs > 0 and (iter + 1) % self.annealing_epochs == 0 and iter > n_inner_min_sparse:
-                self.beta = max(self.beta_min, self.beta * self.annealing_rate)
-                # print(f"Iter {iter + 1}, beta {self.beta:.4f}")
-                # print(f"Iter {iter + 1}: beta = {self.beta}")
 
             if bool_sparse:
                 # We start checking for convergence after we start sparsifying
                 if loss_all / n_batches < best_loss:
                     best_loss = loss_all / n_batches
                     no_improve_steps = 0
-                elif self.beta == self.beta_min:
+                else:
                     no_improve_steps += 1
                     if no_improve_steps >= patience:
                         print(f"  → stopping inner loop at step {iter} after {no_improve_steps} no-improve steps (best={best_loss:.6f}, current={(loss_all / n_batches):.6f})")
