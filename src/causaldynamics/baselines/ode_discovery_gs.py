@@ -256,8 +256,8 @@ class StructuredDynamics(nn.Module):
         # acyclicity enforced on W[-1] only; L1 sparsity on all T slices
         # print(torch.sigmoid(self.M_logits))
 
-        self.f = nn.ModuleList(LipschitzNet(in_dim=t * n, out_dim=1,
-                    hidden_dim=hidden_dim, n_layers=n_layers, L=L_lipschitz) for _ in range(n))
+        self.f = nn.ModuleList(MLP(in_dim=t * n, out_dim=1,
+                    hidden_dim=hidden_dim, n_layers=n_layers) for _ in range(n))
 
     # ── Forward pass ──────────────────────────────────────────────────────────
  
@@ -292,12 +292,43 @@ class StructuredDynamics(nn.Module):
                 
         return out.squeeze(0) if single else out
 
-    def infer(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Deterministic inference-time prediction.
+    # BELOW USES A HARD GATE INSTEAD OF SAMPLING ONCE CONSTRAINT IS ACHIEVED
+    # def forward(self, X: torch.Tensor, ste_th: float, frozen: bool = False) -> torch.Tensor:
+    #     single = X.dim() == 2
+    #     if single:
+    #         X = X.unsqueeze(0)
 
-        Training samples hard-concrete gates; inference uses their clipped mean so
-        repeated predictions from a trained model are reproducible.
+    #     # Once frozen, use the deterministic mean gate (matches infer()) so the
+    #     # realized mask stops jittering even though M_logits itself is fixed.
+    #     M = hard_concrete_mean(self.M_logits) if frozen else sample_hard_concrete(self.M_logits)
+    #     z = X.unsqueeze(-1) * M.unsqueeze(0)
+
+    #     out = []
+    #     for i in range(self.n):
+    #         out.append(self.f[i](z[:, :, :, i].flatten(start_dim=1)))
+    #     out = torch.stack(out, dim=-1)
+
+    #     return out.squeeze(0) if single else out
+
+    def prune_below_threshold(self, threshold: float = 0.5):
+            """
+            Hard-thresholds M_logits. Any gate whose mean is below `threshold`
+            is set to -100.0 logit, forcing its concrete output strictly to 0.0.
+            """
+            with torch.no_grad():
+                mean_gates = hard_concrete_mean(self.M_logits)
+                mask = mean_gates >= threshold
+                # Setting logit to -100 forces sigmoid(logit) -> 0.0
+                self.M_logits.data = torch.where(
+                    mask, 
+                    self.M_logits.data, 
+                    torch.tensor(-100.0, device=self.M_logits.device)
+                )
+
+    def infer(self, X: torch.Tensor, hard_threshold: float | None = 0.5) -> torch.Tensor:
+        """
+        Deterministic evaluation. If `hard_threshold` is provided (e.g. 0.5),
+        gates are strictly binarized to 0.0 or 1.0.
         """
         self.eval()
         with torch.no_grad():
@@ -309,6 +340,11 @@ class StructuredDynamics(nn.Module):
                 X = X.unsqueeze(0)
 
             M = hard_concrete_mean(self.M_logits)
+            
+            # Binarize mask for evaluation if threshold is set
+            if hard_threshold is not None:
+                M = (M >= hard_threshold).float()
+
             z = X.unsqueeze(-1) * M.unsqueeze(0)
 
             out = []
@@ -317,6 +353,33 @@ class StructuredDynamics(nn.Module):
             out = torch.stack(out, dim=-1)
 
             return out.squeeze(0) if single else out
+        
+    # Previous infer9) function
+    # def infer(self, X: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Deterministic inference-time prediction.
+
+    #     Training samples hard-concrete gates; inference uses their clipped mean so
+    #     repeated predictions from a trained model are reproducible.
+    #     """
+    #     self.eval()
+    #     with torch.no_grad():
+    #         single = X.dim() == 2
+    #         if X.dim() == 1:
+    #             single = True
+    #             X = X.view(1, self.t, self.n)
+    #         elif single:
+    #             X = X.unsqueeze(0)
+
+    #         M = hard_concrete_mean(self.M_logits)
+    #         z = X.unsqueeze(-1) * M.unsqueeze(0)
+
+    #         out = []
+    #         for i in range(self.n):
+    #             out.append(self.f[i](z[:, :, :, i].flatten(start_dim=1)))
+    #         out = torch.stack(out, dim=-1)
+
+    #         return out.squeeze(0) if single else out
  
  
 
@@ -385,6 +448,7 @@ class StructuredODEDiscovery():
         sparsity_violation = None
 
         if bool_sparse:
+
             input_grads = torch.autograd.grad(
                 outputs=total,
                 inputs=X_hat,
@@ -401,7 +465,7 @@ class StructuredODEDiscovery():
                 elif l0_l1_l2 == "l2":
                     m_sparse = (m_sparse ** 2).sum()
 
-            sparsity_violation = m_sparse / self.model.n**2 - sparsity_budget
+            sparsity_violation = m_sparse / (self.model.n**2 * self.model.t) - sparsity_budget
 
             # NOTE (matters for recovering the pre-Cooper implementation): the Cooper
             # integration *redefined* the Lipschitz term. All formulations here constrain
@@ -540,21 +604,21 @@ class StructuredODEDiscovery():
         """
         # Build sliding training windows (B, T, N) and targets (B, N)
 
-        print(f"Dimensions: N={self.n}, T={self.t}")
+        # print(f"Dimensions: N={self.n}, T={self.t}")
 
         assert l0_l1_l2 in ["l0", "l1", "l2"], "l0_l1_l2 must be 'l0', 'l1', or 'l2'"
         assert self.n == X.shape[-1], f"Model n={self.n} must match data N={X.shape[-1]}"
         if X.dim() != 3:
             raise ValueError("X must be a 3D tensor with shape (B, T, N) for training")
 
-        print(f"Number of NaN values in X: {torch.isnan(X).any()}")
+        # print(f"Number of NaN values in X: {torch.isnan(X).any()}")
 
         if self.normalize:
             X = X - X.mean(dim=0, keepdim=True)
             X = X / (X.std(dim=0, keepdim=True) + 1e-8) # Small fix
 
-        print(f"Number of NaN values after normalization in X: {torch.isnan(X).any()}")
-        print(f"Constant dimensions in X: {torch.where(X[:, 0].std(dim=0) == 0)}")
+        # print(f"Number of NaN values after normalization in X: {torch.isnan(X).any()}")
+        # print(f"Constant dimensions in X: {torch.where(X[:, 0].std(dim=0) == 0)}")
 
         if self.t == 0:
             X_t_all = X
@@ -611,7 +675,7 @@ class StructuredODEDiscovery():
         dual_formulations = {LAGRANGIAN_FORMULATION, AUGMENTED_LAGRANGIAN_FORMULATION}
         if dual_formulations & set(constraint_formulations.values()):
             if dual_lr is None:
-                dual_lr = lr / 10
+                dual_lr = lr # TODO: check this. Maybe better to keep same learning rate 
             # dual_lr=0 freezes the multipliers at their initial values.
             dual_optimizer = torch.optim.SGD(
                 cooper_cmp.dual_parameters(), lr=dual_lr, maximize=True
@@ -649,6 +713,7 @@ class StructuredODEDiscovery():
             constraint_penalty_all = 0
 
             n_batches = 0
+
             for X_t, X_last in loader:
                 n_batches += 1
 
@@ -694,17 +759,29 @@ class StructuredODEDiscovery():
                 self.plot_loss_components(history, M=1, save_path=save_fig_path)
 
             if bool_sparse:
+                avg_sparsity_violation = sparsity_violation_all / n_batches
                 # We start checking for convergence after we start sparsifying
-                if loss_all / n_batches < best_loss:
-                    best_loss = loss_all / n_batches
-                    no_improve_steps = 0
-                else:
-                    no_improve_steps += 1
-                    if no_improve_steps >= patience:
-                        print(f"  → stopping inner loop at step {iter} after {no_improve_steps} no-improve steps (best={best_loss:.6f}, current={(loss_all / n_batches):.6f})")
-                        break
+                if avg_sparsity_violation <= 0:
+                    current_loss = loss_all / n_batches
+                    if current_loss < best_loss:
+                        best_loss = current_loss
+                        no_improve_steps = 0
+                    else:
+                        no_improve_steps += 1
+                        if no_improve_steps >= patience:
+                            print(f"  → stopping inner loop at step {iter} after {no_improve_steps} no-improve steps (best={best_loss:.6f}, current={(loss_all / n_batches):.6f})")
+                            break
             iter += 1
 
+        # --- Post-Training Hard-Thresholding Check ---
+        final_sparsity_violation = sparsity_violation_all / n_batches
+        if final_sparsity_violation <= 0:
+            print(f"Sparsity budget satisfied (violation = {final_sparsity_violation:.4f}). "
+                  f"Applying hard threshold at cutoff={th}...")
+            # self.model.prune_below_threshold(threshold=th)
+        else:
+            print(f"Warning: Training finished but sparsity constraint was not satisfied "
+                  f"(violation = {final_sparsity_violation:.4f}). Skipping hard pruning.")
         
         print(f"recon={(recon_all / n_batches):.4f}  "
             f"|M|_1={(m_sparse_all / n_batches):.3f}  "
