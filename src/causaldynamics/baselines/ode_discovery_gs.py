@@ -397,6 +397,7 @@ class StructuredODEDiscovery():
         L_lipschitz: float = 2.0,
         is_lipschitz: bool = False,
         normalize: bool = True,
+        normalize_grad: bool = True
     ):
 
         self.t = t
@@ -409,6 +410,7 @@ class StructuredODEDiscovery():
         self.is_lipschitz = is_lipschitz
         self.L_lipschitz = L_lipschitz
         self.normalize = normalize
+        self.normalize_grad = normalize_grad
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Loss
@@ -644,9 +646,16 @@ class StructuredODEDiscovery():
         X_t_all   = X_t_all.to(self.device)
         X_last_all = X_last_all.to(self.device)
 
+        if self.normalize_grad:
+            std_grad = X_last_all.std((0, 1))
+            std_grad[std_grad < 1e-6] = 1.0
+            X_last_all -= X_last_all.mean((0, 1))
+            X_last_all = X_last_all / std_grad
+
         n_samples = X_t_all.shape[0]
         if n_samples == 0:
             raise ValueError("No training samples could be constructed from X and the chosen window length t")
+
 
         if batch_size is None:
             batch_size = n_samples
