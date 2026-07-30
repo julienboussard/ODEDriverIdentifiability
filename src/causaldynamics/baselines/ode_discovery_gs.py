@@ -709,9 +709,11 @@ class StructuredODEDiscovery():
         no_improve_steps = 0
         history: list[dict] = []
 
+        bool_constrained_not_achieved = True
+
         while iter < n_inner:
 
-            bool_sparse = iter >= n_inner_min_sparse 
+            bool_sparse = (iter >= n_inner_min_sparse and bool_constrained_not_achieved)
             gradient_penalty_all = 0
 
             recon_all = 0
@@ -767,12 +769,16 @@ class StructuredODEDiscovery():
             if plot_frequency > 0 and (iter + 1) % plot_frequency == 0:
                 self.plot_loss_components(history, M=1, save_path=save_fig_path)
 
-            if bool_sparse:
+            # print(f"Inner iteration {iter + 1}: Loss = {loss_all / n_batches:.4f}, Sparsity Violation = {sparsity_violation_all / n_batches:.4f}, sparsifying = {bool_sparse}")
+
+            if iter >= n_inner_min_sparse:
                 avg_sparsity_violation = sparsity_violation_all / n_batches
                 # We start checking for convergence after we start sparsifying
                 if avg_sparsity_violation <= 0:
+                    bool_constrained_not_achieved = False
                     current_loss = loss_all / n_batches
-                    if current_loss < best_loss:
+                    if current_loss < best_loss - 1e-4:
+                        print(f"new best loss {current_loss:.6f} after constraint is achieved found at iter {iter}")
                         best_loss = current_loss
                         no_improve_steps = 0
                     else:
@@ -780,6 +786,9 @@ class StructuredODEDiscovery():
                         if no_improve_steps >= patience:
                             print(f"  → stopping inner loop at step {iter} after {no_improve_steps} no-improve steps (best={best_loss:.6f}, current={(loss_all / n_batches):.6f})")
                             break
+                if avg_sparsity_violation > 0:
+                    bool_constrained_not_achieved = True
+                    no_improve_steps = 0
             iter += 1
 
         # --- Post-Training Hard-Thresholding Check ---
