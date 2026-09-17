@@ -603,5 +603,27 @@ def create(
     return da
 
 
+def generate_trajectories(num_timesteps: int = 10000, **kwargs) -> xr.DataArray:
+    """
+    Thin wrapper around `create()` for generating longer ground-truth
+    trajectories, defaulting `num_timesteps` to 10000 instead of
+    `create()`'s default of 300.
+
+    Parameters
+    ----------
+    num_timesteps : int, optional
+        Number of timesteps to simulate. Default is 10000.
+    **kwargs
+        Any other keyword argument accepted by `create()`
+        (e.g. seed, num_nodes, system_name, out_dir_base, save_data, plot).
+
+    Returns
+    -------
+    xarray.DataArray
+        The simulated time series data with dimensions ["time", "node", "dim"].
+    """
+    return create(num_timesteps=num_timesteps, **kwargs)
+
+
 if __name__ == "__main__":
     CLI(create)

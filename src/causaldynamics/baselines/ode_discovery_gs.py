@@ -117,6 +117,7 @@ class StructuredDynamics(nn.Module):
         # ── Structural parameters ─────────────────────────────────────────────
  
         self.M_logits = nn.Parameter(torch.ones(t, n, n) * 2)
+        self.fixed_M = None
         # self.M_logits = nn.Parameter(torch.empty((t, n, n)))
         # nn.init.normal_(self.M_logits, mean=2.0, std=0.01)
 
@@ -136,7 +137,7 @@ class StructuredDynamics(nn.Module):
 
     # ── Forward pass ──────────────────────────────────────────────────────────
  
-    def forward(self, X: torch.Tensor, beta: float = 0.33, n_samples: int = 1) -> torch.Tensor:
+    def forward(self, X: torch.Tensor, beta: float = 0.33, n_samples: int = 1, regularization: str = 'l0') -> torch.Tensor:
         """
         Predict X_{t+1} from X_t.
  
@@ -162,7 +163,13 @@ class StructuredDynamics(nn.Module):
         sample_outputs = []
         for _ in range(n_samples):
             # This for hard concrete distribution i.e. L0 regularization
-            M = sample_hard_concrete(self.M_logits, beta=beta)
+            if self.fixed_M is not None:
+                M = self.fixed_M
+            elif regularization == 'l0':
+                M = sample_hard_concrete(self.M_logits, beta=beta)
+            else:
+                M = torch.sigmoid(self.M_logits)
+
             z = X.unsqueeze(-1) * M.unsqueeze(0)
 
             z = self.bn_2d(z.flatten(start_dim=1)).reshape_as(z)
@@ -209,7 +216,7 @@ class StructuredDynamics(nn.Module):
                 X = X.unsqueeze(0)              # (1, T, N)
 
             # Use deterministic mean instead of sampling
-            M = hard_concrete_mean(self.M_logits)
+            M = self.fixed_M if self.fixed_M is not None else hard_concrete_mean(self.M_logits)
             z = X.unsqueeze(-1) * M.unsqueeze(0)
 
             # Predict X[-1]: (B, T, N*N) -> (B, N)
@@ -219,8 +226,45 @@ class StructuredDynamics(nn.Module):
             out = torch.stack(out, dim=-1)  # (B, N)
 
             return out.squeeze(0) if single else out
- 
- 
+
+    def infer_diff(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable counterpart to `infer`. Used for computing Jacobians
+
+        Same deterministic causal structure (hard_concrete_mean, no sampling),
+        but without `self.eval()`/`torch.no_grad()`, so it can be
+        differentiated w.r.t. `X` -- e.g. via `torch.func.jacrev` for
+        Lyapunov exponent estimation. `infer` itself cannot be used there:
+        `torch.func.jacrev` silently returns an all-zero Jacobian for a
+        function whose body runs under `torch.no_grad()`, with no error.
+
+        Parameters
+        ----------
+        X : (batch, T, N) or (T, N)
+            Input window of shape (batch, context_length, num_variables) or (context_length, num_variables)
+
+        Returns
+        -------
+        X_hat : (batch, N) or (N,)
+            Predicted next step, same shape as input minus time dimension
+        """
+        single = X.dim() == 2
+        if single:
+            X = X.unsqueeze(0)              # (1, T, N)
+
+        # Use deterministic mean instead of sampling
+        M = self.fixed_M if self.fixed_M is not None else hard_concrete_mean(self.M_logits)
+        z = X.unsqueeze(-1) * M.unsqueeze(0)
+
+        # Predict X[-1]: (B, T, N*N) -> (B, N)
+        out = []
+        for i in range(self.n):
+            out.append(self.f[i](z[:, :, :, i].flatten(start_dim=1)))
+        out = torch.stack(out, dim=-1)  # (B, N)
+
+        return out.squeeze(0) if single else out
+
+
 
 class StructuredODEDiscovery():
 
@@ -277,7 +321,7 @@ class StructuredODEDiscovery():
         lambda_w   : L1 weight for W
         lambda_grad: gradient penalty weight
         """
-        X_hat = self.model(X_windows, beta=beta, n_samples=n_samples)
+        X_hat = self.model(X_windows, beta=beta, n_samples=n_samples, regularization=l0_l1_l2)
 
         # Average the reconstruction loss over all sampled hard-concrete masks.
         if X_hat.dim() == 3 and X_hat.shape[0] == n_samples:
@@ -303,7 +347,9 @@ class StructuredODEDiscovery():
         recon = total.item()
 
         if bool_sparse:
-            if l0_l1_l2 == "l0":
+            if self.model.fixed_M is not None:
+                m_sparse = self.model.fixed_M.sum()
+            elif l0_l1_l2 == "l0":
                 m_sparse = hard_concrete_sparsity(self.model.M_logits, beta=beta)
             else:
                 m_sparse = torch.sigmoid(self.model.M_logits) 
@@ -410,7 +456,8 @@ class StructuredODEDiscovery():
             n_samples: int = 3,
             n_inner_min_sparse: int = 0, # before sparsification
             th: float = 0.5, 
-            patience: int = 50,
+            patience: int = 200,
+            n_iter_after_fixed: int = 100,
             plot_frequency: int = 500,
             return_history: bool = False,
             save_fig_path: str | None = None
@@ -447,8 +494,8 @@ class StructuredODEDiscovery():
         assert self.n == X.shape[-1], f"Model n={self.n} must match data N={X.shape[-1]}"
         assert n_samples >= 1, "n_samples must be at least 1"
         # if self.t == 1: 
-        if X.dim() != 3:
-            raise ValueError("X must be a 3D tensor with shape (B, T, N) for training (T=1)")
+        # if X.dim() != 3:
+        #     raise ValueError("X must be a 3D tensor with shape (B, T, N) for training (T=1)")
 
         print(f"Number of NaN values in X: {torch.isnan(X).any()}")
 
@@ -531,9 +578,11 @@ class StructuredODEDiscovery():
         iter = 0
         best_loss = float('inf')
         no_improve_steps = 0
+        mask_frozen = False
+        training_until = n_inner
         history: list[dict] = []
 
-        while iter < n_inner:
+        while iter < training_until:
 
             bool_sparse = iter >= n_inner_min_sparse 
             gradient_penalty_all = 0
@@ -589,7 +638,7 @@ class StructuredODEDiscovery():
                 # print(f"Iter {iter + 1}, beta {self.beta:.4f}")
                 # print(f"Iter {iter + 1}: beta = {self.beta}")
 
-            if bool_sparse:
+            if bool_sparse and not mask_frozen:
                 # We start checking for convergence after we start sparsifying
                 if loss_all / n_batches < best_loss:
                     best_loss = loss_all / n_batches
@@ -597,8 +646,12 @@ class StructuredODEDiscovery():
                 elif self.beta == self.beta_min:
                     no_improve_steps += 1
                     if no_improve_steps >= patience:
-                        print(f"  → stopping inner loop at step {iter} after {no_improve_steps} no-improve steps (best={best_loss:.6f}, current={(loss_all / n_batches):.6f})")
-                        break
+                        self.model.fixed_M = (torch.sigmoid(self.model.M_logits) > th).to(self.model.M_logits.dtype)
+                        self.model.fixed_M.requires_grad = False
+                        optimizer = torch.optim.Adam(other_params, lr=lr)
+                        mask_frozen = True
+                        training_until = iter + n_iter_after_fixed
+                        print(f"  → fixed M at step {iter + 1} after {no_improve_steps} no-improve steps; training MLPs until step {training_until}")
             iter += 1
 
         
@@ -608,10 +661,13 @@ class StructuredODEDiscovery():
 
         self.plot_loss_components(history, M=1, save_path=save_fig_path)
 
+        final_M = self.model.fixed_M if self.model.fixed_M is not None else torch.sigmoid(self.model.M_logits)
         if return_history:
-            return self.model, torch.sigmoid(self.model.M_logits)
+            return self.model, final_M, history
 
-        return self.model, torch.sigmoid(self.model.M_logits) #.transpose(2, 1) # Should we transpose here? a priori no
+        # TODO return either final_M or the logits - for AUROC / AUPRC...
+
+        return self.model, final_M #.transpose(2, 1) # Should we transpose here? a priori no
     
     
 def sample_hard_concrete(log_alpha, beta=0.33, zeta=-0.1, gamma=1.1):

@@ -3,7 +3,7 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 
-def score(preds, labs, name="Result"):
+def score(preds, labs, shd_threshold = 0.5, name="Result"):
     """
     Calculates AUROC and AUPRC metrics given preds and labs.
     Accepts either a 2D or a 3D tensor (batch of summary graphs).
@@ -60,7 +60,7 @@ def score(preds, labs, name="Result"):
     null_model_auprc = average_precision_score(labs, np.zeros_like(preds))
 
     #  Joint SHD: total mismatches over the entire flattened batch
-    joint_shd = np.sum(np.abs((preds >= 0.5).astype(int) - labs.astype(int)))
+    joint_shd = np.sum(np.abs((preds >= shd_threshold).astype(int) - labs.astype(int)))
 
     out = pd.DataFrame(
         [
