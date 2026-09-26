@@ -23,10 +23,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 import matplotlib.pyplot as plt
 import math
 import numpy as np
+from scipy.stats import gaussian_kde
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MLP  (shared over full N-dim vector)
@@ -172,7 +173,7 @@ class StructuredDynamics(nn.Module):
 
             z = X.unsqueeze(-1) * M.unsqueeze(0)
 
-            z = self.bn_2d(z.flatten(start_dim=1)).reshape_as(z)
+            # z = self.bn_2d(z.flatten(start_dim=1)).reshape_as(z)
 
             # Step 4 — flatten N*N and predict X[-1]
             # (B, T, N*N)  ->  (B, N)
@@ -268,7 +269,7 @@ class StructuredDynamics(nn.Module):
 
 class StructuredODEDiscovery():
 
-    def __init__(self, n: int, t: int, device, coupled=True, instantaneous: bool = False, hidden_dim: int = 8, n_layers: int = 2, L_lipschitz: float = 2.0, is_lipschitz: bool = True, normalize: bool = True, normalize_grad: bool = False, beta_init: float = 2, beta_min: float = 0.5, annealing_rate: float = 0.95, annealing_epochs: int = 20):
+    def __init__(self, n: int, t: int, device, coupled=True, instantaneous: bool = False, hidden_dim: int = 8, n_layers: int = 2, L_lipschitz: float = 2.0, is_lipschitz: bool = True, normalize: bool = True, normalize_grad: bool = False, beta_init: float = 2, beta_min: float = 0.5, annealing_rate: float = 0.95, annealing_epochs: int = 20, n_time_predict: int = 1):
 
         self.t = t
         self.n = n
@@ -286,11 +287,53 @@ class StructuredODEDiscovery():
         self.annealing_rate = annealing_rate
         self.annealing_epochs = max(1, annealing_epochs)
         self.normalize_grad = normalize_grad
+        self.n_time_predict = n_time_predict
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Rollout
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def _rollout(self, X_windows: torch.Tensor, beta: float, n_samples: int, regularization: str) -> torch.Tensor:
+        """
+        Roll out `self.n_time_predict` steps autoregressively: at each step the
+        model predicts the normalized gradient, which is unnormalized and added
+        to the previous timestep to get the next input window.
+
+        The causal mask M is sampled once per trajectory (outer sample) and
+        reused across all `n_time_predict` steps of that trajectory, rather than
+        resampled at every step.
+        """
+        original_fixed_M = self.model.fixed_M
+        samples = []
+        for _ in range(n_samples):
+            if original_fixed_M is not None:
+                M = original_fixed_M
+            elif regularization == 'l0':
+                M = sample_hard_concrete(self.model.M_logits, beta=beta)
+            else:
+                M = torch.sigmoid(self.model.M_logits)
+            self.model.fixed_M = M
+
+            X_cur = X_windows
+            prev = X_cur[:, -1, :]
+            steps = []
+            for _ in range(self.n_time_predict):
+                out = self.model(X_cur, beta=beta, n_samples=1, regularization=regularization)
+                out = out.squeeze(-2)  # model returns (batch, 1, N) for a single sample; drop the singleton
+                next_step = out * self.std_grad + self.mean_grad + prev
+                steps.append(next_step)
+                X_cur = torch.cat([X_cur[:, 1:, :], next_step.unsqueeze(1)], dim=1)
+                prev = next_step
+            samples.append(torch.stack(steps, dim=1))  # (batch, n_time_predict, N)
+        self.model.fixed_M = original_fixed_M
+
+        X_hat = torch.stack(samples, dim=0)  # (n_samples, batch, n_time_predict, N)
+        return X_hat if n_samples > 1 else X_hat[0]
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Loss
     # ─────────────────────────────────────────────────────────────────────────────
-    
+
     def loss_fn(self,
                 X_windows: torch.Tensor,
                 X_target: torch.Tensor,
@@ -321,10 +364,13 @@ class StructuredODEDiscovery():
         lambda_w   : L1 weight for W
         lambda_grad: gradient penalty weight
         """
-        X_hat = self.model(X_windows, beta=beta, n_samples=n_samples, regularization=l0_l1_l2)
+        if self.n_time_predict > 1:
+            X_hat = self._rollout(X_windows, beta=beta, n_samples=n_samples, regularization=l0_l1_l2)
+        else:
+            X_hat = self.model(X_windows, beta=beta, n_samples=n_samples, regularization=l0_l1_l2)
 
         # Average the reconstruction loss over all sampled hard-concrete masks.
-        if X_hat.dim() == 3 and X_hat.shape[0] == n_samples:
+        if X_hat.dim() == X_target.dim() + 1 and X_hat.shape[0] == n_samples:
             sample_losses = [F.mse_loss(X_hat[i], X_target) for i in range(n_samples)]
             total = torch.stack(sample_losses).mean()
             input_grads = torch.autograd.grad(
@@ -460,7 +506,9 @@ class StructuredODEDiscovery():
             n_iter_after_fixed: int = 100,
             plot_frequency: int = 500,
             return_history: bool = False,
-            save_fig_path: str | None = None
+            save_fig_path: str | None = None,
+            return_statistics: bool = False,
+            density_weighting: bool = False,
             ) -> tuple[StructuredDynamics, torch.Tensor] | tuple[StructuredDynamics, torch.Tensor, list[dict]]:
         """
         Fit the model to a time series X of shape (T, N).
@@ -499,18 +547,25 @@ class StructuredODEDiscovery():
 
         print(f"Number of NaN values in X: {torch.isnan(X).any()}")
 
+        mean_data = 0
+        std_data = 1
+        mean_grad = 0
+        std_grad = 1
+
         if self.normalize:
-            X = X - X.mean(dim=0, keepdim=True)
-            X = X / (X.std(dim=0, keepdim=True) + 1e-8) # Small fix
+            mean_data = X.mean(dim=0, keepdim=True)
+            print(f"Mean of data: {mean_data}")
+            std_data = X.std(dim=0, keepdim=True)
+            print(f"Standard deviation of data: {std_data}")
+            X -= mean_data
+            X /= std_data
 
         print(f"Number of NaN values after normalization in X: {torch.isnan(X).any()}")
         print(f"Constant dimensions in X: {torch.where(X[:, 0].std(dim=0) == 0)}")
 
         if not self.coupled:
-            if self.t == 0:
-                X_t_all = X
-                X_last_all = X
-            elif self.t == 1:
+            assert self.t > 0
+            if self.t == 1:
                 X_t_all = X[:-1]
                 # Important to predict the difference and not the next step to avoid predicting identity
                 X_last_all = X[1:] - X[:-1]
@@ -519,6 +574,7 @@ class StructuredODEDiscovery():
                     raise ValueError(f"Time series length T={X.shape[0]} must be larger than window length t={self.t}")
                 X_t_all = torch.stack([X[i : i + self.t] for i in range(X.shape[0] - self.t)], dim=0)
                 X_last_all = X[self.t:] - X[self.t - 1 : -1]
+                print(f"Standard deviation of gradients FIRST: {X_last_all.std(0)}")
             if self.t > 1:
                 X_t_all = X_t_all.squeeze(2)
         else:
@@ -541,10 +597,25 @@ class StructuredODEDiscovery():
         print("X_last_all.shape:", X_last_all.shape)
 
         if self.normalize_grad:
-            std_grad = X_last_all.std((0, 1))
-            std_grad[std_grad < 1e-6] = 1.0
-            X_last_all -= X_last_all.mean((0, 1))
-            X_last_all = X_last_all / std_grad
+            std_grad = X_last_all.std(0).clamp_min(1e-6) # TODO WAS .std((0, 1)) Problem??? SHould not be like this... unless it has a first dimension... Rerun causaldynamics? 
+            print(f"Standard deviation of gradients: {std_grad}")
+            mean_grad = X_last_all.mean(0)
+            print(f"Mean of gradients: {mean_grad}")
+            X_last_all -= mean_grad
+            X_last_all /= std_grad
+
+        self.mean_grad = mean_grad.to(self.device) if torch.is_tensor(mean_grad) else mean_grad
+        self.std_grad = std_grad.to(self.device) if torch.is_tensor(std_grad) else std_grad
+
+        if self.n_time_predict > 1:
+            assert self.t > 1, "n_time_predict > 1 requires a context window t > 1"
+            n_future = self.n_time_predict
+            n_valid = X_t_all.shape[0] - (n_future - 1)
+            if n_valid <= 0:
+                raise ValueError("Time series too short for the requested n_time_predict")
+            X_t_all = X_t_all[:n_valid]
+            # ground-truth absolute values (normalized-data space) for each rollout step
+            X_last_all = torch.stack([X[self.t + k : self.t + k + n_valid] for k in range(n_future)], dim=1)
 
         X_t_all   = X_t_all.to(self.device)
         X_last_all = X_last_all.to(self.device)
@@ -566,14 +637,23 @@ class StructuredODEDiscovery():
         gate_params = [p for name, p in self.model.named_parameters() if "M_logits" in name]
         other_params = [p for name, p in self.model.named_parameters() if "M_logits" not in name]
 
-        optimizer = torch.optim.Adam([
-            {"params": other_params, "lr": lr},
-            {"params": gate_params,  "lr": 10 * lr, "betas": (0.9, 0.98)}, #, "betas": (0.9, 0.98)  # higher lr??, lower beta2
-        ])
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+        # optimizer = torch.optim.Adam([
+        #     {"params": other_params, "lr": lr},
+        #     {"params": gate_params,  "lr": 10 * lr, "betas": (0.9, 0.98)}, #, "betas": (0.9, 0.98)  # higher lr??, lower beta2
+        # ])
+
+        sampler = None
+        if density_weighting:
+            flat_targets = X_last_all.reshape(n_dataset_samples, -1).detach().cpu().numpy()
+            density = gaussian_kde(flat_targets.T)(flat_targets.T)
+            weights = 1.0 / (density + 1e-8)
+            sampler = WeightedRandomSampler(weights, num_samples=n_dataset_samples, replacement=True)
 
         # Prepare a DataLoader to avoid Python-side indexing/permutation overhead
         dataset = TensorDataset(X_t_all, X_last_all)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
 
         iter = 0
         best_loss = float('inf')
@@ -663,11 +743,16 @@ class StructuredODEDiscovery():
 
         final_M = self.model.fixed_M if self.model.fixed_M is not None else torch.sigmoid(self.model.M_logits)
         if return_history:
-            return self.model, final_M, history
+            if not return_statistics:
+                return self.model, final_M, history
+            else:
+                return self.model, final_M, history, (mean_data, std_data, mean_grad, std_grad)
 
         # TODO return either final_M or the logits - for AUROC / AUPRC...
-
-        return self.model, final_M #.transpose(2, 1) # Should we transpose here? a priori no
+        if not return_statistics:
+            return self.model, final_M #.transpose(2, 1) # Should we transpose here? a priori no
+        else:
+            return self.model, final_M, (mean_data, std_data, mean_grad, std_grad)
     
     
 def sample_hard_concrete(log_alpha, beta=0.33, zeta=-0.1, gamma=1.1):

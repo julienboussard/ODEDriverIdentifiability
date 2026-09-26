@@ -37,10 +37,18 @@ class PathRegMLP(nn.Module):
         self.gate_logits = nn.ParameterList(
             nn.Parameter(torch.full((dim,), math.log(4.0))) for dim in dims[:-1]
         )
+        self.fixed_gates = None
 
     def _gates(self, sample):
+        if self.fixed_gates is not None:
+            return self.fixed_gates
         return [sample_hard_concrete(p) if sample and self.training else hard_concrete_mean(p)
                 for p in self.gate_logits]
+
+    def freeze_gates(self, th=0.5):
+        self.fixed_gates = [(hard_concrete_mean(p) > th).float() for p in self.gate_logits]
+        for p in self.gate_logits:
+            p.requires_grad_(False)
 
     def forward(self, x, sample=True):
         for i, (linear, gate) in enumerate(zip(self.linears, self._gates(sample))):
@@ -84,6 +92,10 @@ class StructuredDynamicsPathReg(nn.Module):
         strengths = torch.stack([net.path_strength()[:, 0] for net in self.f], dim=-1)
         return strengths.reshape(self.t, self.n, self.n)
 
+    def freeze_gates(self, th=0.5):
+        for net in self.f:
+            net.freeze_gates(th)
+
     def input_output_probabilities(self, beta=1.0 / 3.0):
         """Return first-layer gate probabilities as an ``(n, n)`` mask.
 
@@ -95,6 +107,7 @@ class StructuredDynamicsPathReg(nn.Module):
         if self.t != 1:
             raise ValueError("input_output_probabilities requires t=1")
         probabilities = torch.stack([
+            network.fixed_gates[0] if network.fixed_gates is not None else
             torch.sigmoid(
                 network.gate_logits[0]
                 - beta * math.log(-_ZETA / _GAMMA)
@@ -132,7 +145,8 @@ class StructuredODEDiscoveryPathReg:
         fig.savefig(save_path or "pathreg_loss.png"); plt.close(fig)
 
     def run(self, X, n_inner=10_000, lr=1e-3, lambda_path=0.01, lambda_grad=10,
-            batch_size=None, patience=50, plot_frequency=500, return_history=False,
+            batch_size=None, patience=50, th=0.5, n_iter_after_fixed=100,
+            plot_frequency=500, return_history=False,
             save_fig_path=None, n_inner_min_sparse=0):
         if X.dim() != 3:
             raise ValueError("X must have shape (time, 1, n) or (time, t, n)")
@@ -163,7 +177,10 @@ class StructuredODEDiscoveryPathReg:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         loader = DataLoader(TensorDataset(windows, target), batch_size=batch_size, shuffle=True)
         history, best, stale = [], float("inf"), 0
-        for step in range(n_inner):
+        mask_frozen = False
+        training_until = n_inner
+        step = 0
+        while step < training_until:
             if step < n_inner_min_sparse:
                 step_lambda_path, step_lambda_grad = 0., 0.
             else:
@@ -179,10 +196,20 @@ class StructuredODEDiscoveryPathReg:
             history.append(entry)
             if plot_frequency > 0 and (step + 1) % plot_frequency == 0:
                 self.plot_loss_components(history, save_fig_path)
-            if entry["total"] < best: best, stale = entry["total"], 0
-            else:
+            if entry["total"] < best:
+                best, stale = entry["total"], 0
+            elif not mask_frozen:
                 stale += 1
-                if stale >= patience: break
+                if stale >= patience:
+                    self.model.freeze_gates(th)
+                    optimizer = torch.optim.Adam(
+                        [p for net in self.model.f for p in net.linears.parameters()], lr=lr
+                    )
+                    mask_frozen = True
+                    training_until = step + n_iter_after_fixed
+                    print(f"  → fixed gates at step {step + 1} after {stale} no-improve steps; "
+                          f"training MLPs until step {training_until}")
+            step += 1
         self.plot_loss_components(history, save_fig_path)
         if self.t == 1:
             mask = self.model.input_output_probabilities()

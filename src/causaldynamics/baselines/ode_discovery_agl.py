@@ -271,6 +271,7 @@ class StructuredODEDiscoveryAGL():
             batch_size: int | None = None,
             n_inner_min_sparse: int = 0, # pilot phase, before AGL proximal step kicks in
             patience: int = 50,
+            n_iter_after_fixed: int = 100,
             plot_frequency: int = 500,
             return_history: bool = False,
             save_fig_path: str | None = None
@@ -367,9 +368,7 @@ class StructuredODEDiscoveryAGL():
             raise ValueError("batch_size must be a positive integer")
 
         batch_size = min(batch_size, n_dataset_samples)
-
         self.model = StructuredDynamicsAGL(n=self.n, t=self.t, hidden_dim=self.hidden_dim, n_layers=self.n_layers).to(self.device)
-
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
         # Prepare a DataLoader to avoid Python-side indexing/permutation overhead
@@ -379,10 +378,13 @@ class StructuredODEDiscoveryAGL():
         iter = 0
         best_loss = float('inf')
         no_improve_steps = 0
+        mask_frozen = False
+        training_until = n_inner
+        zero_col_mask = None  # per-output list of [d_in] 0/1 tensors, set once frozen
         history: list[dict] = []
         lam = lambda_init  # plain (non-adaptive, scalar) group lasso weight during the pilot phase
 
-        while iter < n_inner:
+        while iter < training_until:
 
             bool_sparse = iter >= n_inner_min_sparse
 
@@ -416,9 +418,14 @@ class StructuredODEDiscoveryAGL():
                 loss.backward()
                 optimizer.step()
 
-                for i in range(self.n):
-                    lam_i = lam[i] if isinstance(lam, list) else lam
-                    group_soft_threshold(self.model.f[i].net[0].weight, lam_i, alpha=lr)
+                if not mask_frozen:
+                    for i in range(self.n):
+                        lam_i = lam[i] if isinstance(lam, list) else lam
+                        group_soft_threshold(self.model.f[i].net[0].weight, lam_i, alpha=lr)
+                else:
+                    with torch.no_grad():
+                        for i in range(self.n):
+                            self.model.f[i].net[0].weight.mul_(zero_col_mask[i])
 
             with torch.no_grad():
                 col_norm_sum = sum(
@@ -437,7 +444,7 @@ class StructuredODEDiscoveryAGL():
             if plot_frequency > 0 and (iter + 1) % plot_frequency == 0:
                 self.plot_loss_components(history, M=1, save_path=save_fig_path)
 
-            if bool_sparse:
+            if bool_sparse and not mask_frozen:
                 # We start checking for convergence after we start sparsifying
                 if loss_all / n_batches < best_loss:
                     best_loss = loss_all / n_batches
@@ -445,8 +452,16 @@ class StructuredODEDiscoveryAGL():
                 else:
                     no_improve_steps += 1
                     if no_improve_steps >= patience:
-                        print(f"  → stopping inner loop at step {iter} after {no_improve_steps} no-improve steps (best={best_loss:.6f}, current={(loss_all / n_batches):.6f})")
-                        break
+                        with torch.no_grad():
+                            zero_col_mask = [
+                                (self.model.f[i].net[0].weight.norm(dim=0) > 0).float()
+                                for i in range(self.n)
+                            ]
+                        mask_frozen = True
+                        training_until = iter + n_iter_after_fixed
+                        print(f"  → freezing AGL penalty at step {iter} after {no_improve_steps} no-improve steps "
+                              f"(best={best_loss:.6f}, current={(loss_all / n_batches):.6f}); "
+                              f"zeroed columns locked, training until step {training_until}")
             iter += 1
 
         print(f"recon={(recon_all / n_batches):.4f}  "

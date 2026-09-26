@@ -6,6 +6,7 @@ import dysts.flows as flows
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import sys
 
 from .baselines import (
     StructuredODEDiscovery,
@@ -24,7 +25,6 @@ from .metrics import (
     valid_prediction_time,
     wasserstein_distance,
 )
-
 
 def _new_system(system_name, rng):
     system = getattr(flows, system_name)()
@@ -59,7 +59,7 @@ def _one_step_predictions(model, trajectory, state_mean, state_std,
         prediction[step] = (normalized_next * state_std + state_mean).cpu().numpy()
     return prediction
 
-def train_gs(models, training_input, dimension, device,  name, lambda_m, lambda_grad, patience = 200, n_iter_after_fixed = 200):
+def train_gs(models, training_input, dimension, device,  name, lambda_m, lambda_grad, patience = 200, n_inner_min_sparse=100, n_iter_after_fixed = 200):
     discovery = StructuredODEDiscovery(
         coupled=False, t=1, n=dimension, L_lipschitz=1,
         is_lipschitz=False, hidden_dim=8, n_layers=2, device=device,
@@ -69,8 +69,8 @@ def train_gs(models, training_input, dimension, device,  name, lambda_m, lambda_
     models[name], _ = discovery.run(
         n_samples=5, lambda_grad=lambda_grad, X=training_input,
         l0_l1_l2="l1" if name == "C-NODE" else "l0", th=0.5,
-        lr=0.001, lambda_m=lambda_m, n_inner_min_sparse=100,
-        batch_size=128, n_inner=2000,
+        lr=0.001, lambda_m=lambda_m, n_inner_min_sparse=n_inner_min_sparse,
+        batch_size=256, n_inner=2000,
         patience=patience, n_iter_after_fixed=n_iter_after_fixed,
     )
     return models
@@ -84,51 +84,74 @@ def _train_models(train_trajectory, dimension, device):
     normalized = (torch.as_tensor(train_trajectory, dtype=torch.float32,
                                    device=device) - train_mean) / train_std
     increments = normalized[1:] - normalized[:-1]
-    increment_mean = increments.mean(dim=(0, 1))
-    increment_std = increments.std(dim=(0, 1)).clamp_min(1e-6)
+    print(f"Increment shape : {increments.shape}")
+    increment_mean = increments.mean(dim=(0))
+    increment_std = increments.std(dim=(0)).clamp_min(1e-6)
     training_input = normalized[:, None, :]
 
     # print(f"train_trajectory.shape: {train_trajectory.shape}")
 
     models = {}
-    print("Train AGL")
-    agl = StructuredODEDiscoveryAGL(
-        coupled=False, t=1, n=dimension, hidden_dim=8, n_layers=2,
-        device=device, normalize=True, normalize_grad=True,
-    )
-    models["agl"], _ = agl.run(
-        lambda_grad=0, lambda_init=0.0, lambda_m=0.05, lr=0.001,
-        n_inner_min_sparse=50, batch_size=128, n_inner=1000,
-        patience=1000, X=training_input,
-    )
+    # print("Train AGL")
+    # agl = StructuredODEDiscoveryAGL(
+    #     coupled=False, t=1, n=dimension, hidden_dim=8, n_layers=2,
+    #     device=device, normalize=True, normalize_grad=True,
+    # )
+    # models["agl"], _ = agl.run(
+    #     lambda_grad=0, lambda_init=0.0, lambda_m=0.05, lr=0.001,
+    #     n_inner_min_sparse=50, batch_size=128, n_inner=1000,
+    #     patience=1000, X=training_input, n_iter_after_fixed = 200
+    # )
 
-    print("train L0")
-    first_name = "L0-NODE GP 0 pat. 10"
-    models = train_gs(models, training_input, dimension, device, first_name, 0.025, 0, n_iter_after_fixed = 10)
-    models = train_gs(models, training_input, dimension, device, "L0-NODE GP 0 pat. 50", 0.025, 0, n_iter_after_fixed = 50)
-    models = train_gs(models, training_input, dimension, device, "L0-NODE gp 0 pat 100", 0.025, 0, n_iter_after_fixed = 100)
-    models = train_gs(models, training_input, dimension, device, "L0-NODE gp 0 pat 200", 0.025, 0, n_iter_after_fixed = 200)
-    models = train_gs(models, training_input, dimension, device, "L0-NODE gp 0 pat 500", 0.025, 0, n_iter_after_fixed = 500)
-    # print("train l1")
-    # models = train_gs(models, training_input, dimension, device, "C-NODE", 50.0, 10)
-    print("train NODE")
-    models = train_gs(models, training_input, dimension, device, "NODE gp 0 pat 0", 0.0, 0, n_iter_after_fixed = 0)
+    first_name = "L0-NODE 0.01 gp 0 nminsparse 0 nafter 0"
+
+    for lambda_m in [0.01, 0.05, 0.1, 0.5]: #0.5, 1.0, 5.0
+        for lambda_grad in [0, 10, 100]: # 1000, 10_000
+            for n_inner_min_sparse in [0, 25, 50, 100]:
+                for n_iter_after_fixed in [100, 200, 500]: #0, 50
+                    name = f"L0-NODE {lambda_m} gp {lambda_grad} nminsparse {n_inner_min_sparse} nafter {n_iter_after_fixed}"
+                    print(f"Running on {name}")
+                    models = train_gs(models, training_input, dimension, device, name, lambda_m, lambda_grad, n_inner_min_sparse=n_inner_min_sparse, n_iter_after_fixed = n_iter_after_fixed)
+
+    # print("train L0")
+    # first_name = "L0-NODE 1 gp 0 pat 200"
+    # # models = train_gs(models, training_input, dimension, device, first_name, 0.05, 0, n_iter_after_fixed = 10)
+    # # models = train_gs(models, training_input, dimension, device, "L0-NODE GP 0 pat. 50", 0.1, 0, n_iter_after_fixed = 50)
+    # # models = train_gs(models, training_input, dimension, device, "L0-NODE gp 0 pat 100", 0.25, 0, n_iter_after_fixed = 100)
+    # # models = train_gs(models, training_input, dimension, device, "L0-NODE gp 0 pat 200", 0.025, 0, n_iter_after_fixed = 100)
+    # models = train_gs(models, training_input, dimension, device, first_name, 1, 0, n_iter_after_fixed = 200)
+    # models = train_gs(models, training_input, dimension, device, "L0-NODE 0.5 gp 100 pat 200", 0.5, 100, n_iter_after_fixed = 200)
+    # models = train_gs(models, training_input, dimension, device, "L0-NODE 0.1 gp 100 pat 200", 0.1, 100, n_iter_after_fixed = 200)
+    # models = train_gs(models, training_input, dimension, device, "L0-NODE 0.05 gp 100 pat 200", 0.05, 100, n_iter_after_fixed = 200)
+    # # print("train l1")
+    # # models = train_gs(models, training_input, dimension, device, "C-NODE", 50.0, 10)
+    # print("train NODE")
+    # models = train_gs(models, training_input, dimension, device, "NODE gp 0 pat 0", 0.0, 0, n_iter_after_fixed = 200)
     # models = train_gs(models, training_input, dimension, device, "NODE gp 0 pat 0", 0.0, 1000, n_iter_after_fixed = 0)
     # print("train no grad")
     # models = train_gs(models, training_input, dimension, device, "No grad reg.", 0.025, 0)
 
 
-    print("train pathreg")
-    pathreg = StructuredODEDiscoveryPathReg(
-        coupled=False, t=1, n=dimension, hidden_dim=8, n_layers=2,
-        device=device, normalize=True, normalize_grad=True,
-    )
-    models["pathreg"], _ = pathreg.run(
-        lambda_grad=0, lambda_path=0.05, X=training_input, lr=0.001,
-        n_inner_min_sparse=100, batch_size=128, n_inner=2000, patience=200,
-    )
+    # print("train pathreg")
+    # pathreg = StructuredODEDiscoveryPathReg(
+    #     coupled=False, t=1, n=dimension, hidden_dim=8, n_layers=2,
+    #     device=device, normalize=True, normalize_grad=True,
+    # )
+    # models["pathreg"], _ = pathreg.run(
+    #     lambda_grad=0, lambda_path=0.05, X=training_input, lr=0.001,
+    #     n_inner_min_sparse=100, batch_size=128, n_inner=2000, patience=200, n_iter_after_fixed = 200
+    # )
+
     return models, train_mean, train_std, increment_mean, increment_std, first_name
 
+
+
+NOISE_LEVEL = 0.05
+
+def noise_for_system(system, n=2000, **kw):
+    """Pick an absolute noise amplitude as a fraction of the attractor's spread."""
+    _, clean = system.make_trajectory(n, return_times=True, standardize=False, **kw)
+    return np.mean(np.std(clean, axis=0))
 
 def run_dysts(system_name, save_fig_path, device=None, seed=0):
     """Train and evaluate all requested discovery models on one dysts system.
@@ -143,62 +166,50 @@ def run_dysts(system_name, save_fig_path, device=None, seed=0):
     rng = np.random.default_rng(seed)
     reference_system = getattr(flows, system_name)()
     lyapunov_exponents = true_lyapunov_exponents(reference_system)
+    
     lambda_1 = float(lyapunov_exponents[0])
     if lambda_1 <= 0:
         raise ValueError(f"The first Lyapunov exponent must be positive, got {lambda_1}")
 
-    use_lyapunov_times = 1.0 / lambda_1 > 20
-    train_steps = int(np.ceil(50 / lambda_1)) if use_lyapunov_times else 1000
-    test_steps = int(np.ceil(250 / lambda_1)) if use_lyapunov_times else 5000
-    metric_steps = int(np.ceil(5 / lambda_1)) if use_lyapunov_times else 50
-    burn_steps = int(np.ceil(50 / lambda_1)) if use_lyapunov_times else 1000
+    lam, period = reference_system.maximum_lyapunov_estimated, reference_system.period
 
+    tpts, _ = reference_system.make_trajectory(100, return_times=True)
+    dt = float(np.diff(np.asarray(tpts)).mean())
+    ppp_fine = period / dt
+
+    lambda_1_dt = lambda_1 * dt
+
+    train_steps = int(max(1000, min(10_000, np.ceil(50 / lambda_1_dt))))
+    test_steps = int(max(5000, min(50_000, np.ceil(250 / lambda_1_dt))))
+    metric_steps = int(max(100, min(1000, np.ceil(0 / lambda_1_dt))))
+    burn_steps = train_steps
+    
     print("Make trajectories")
-    train_tpts, train_trajectory = reference_system.make_trajectory(
-        train_steps, return_times=True
+    sigma = NOISE_LEVEL*noise_for_system(reference_system)
+    
+    tpts, train_trajectory = reference_system.make_trajectory(
+        train_steps, return_times=True, standardize=False, noise=sigma, pts_per_period = ppp_fine
     )
+
     train_trajectory = np.asarray(train_trajectory)
+    mu, std = train_trajectory.mean(0), train_trajectory.std(0)
+    train_trajectory= (train_trajectory - mu) / std
+
+
     # Actual sampling interval of `make_trajectory`'s output, which (like in
     # `true_lyapunov_exponents`) generally differs from `system.dt` due to
     # its default Fourier-timescale resampling -- needed to get exponents
     # from `nn_lyapunov_exponents_delta` in the same time units as
     # `true_lyapunov_exponents`.
-    dt = float(np.diff(np.asarray(train_tpts)).mean())
 
     test_trajectories = np.stack([
-        np.asarray(_new_system(system_name, trajectory_rng).make_trajectory(test_steps))
+        (np.asarray(_new_system(system_name, trajectory_rng).make_trajectory(test_steps, standardize=False, noise=sigma, pts_per_period = ppp_fine)) - mu) / std
         for trajectory_rng in rng.spawn(3) # Here, using 3 test trajectories each time
     ])
 
-    # trajectories_dimension = train_trajectory.shape[-1]
-    # trajectories_colors = ["steelblue", "firebrick", "seagreen", "darkorange"]
-    # trajectories_labels = ["train"] + [
-    #     f"test {index}" for index in range(test_trajectories.shape[0])
-    # ]
-    # trajectories_figure = plt.figure(figsize=(8, 8))
-    # if trajectories_dimension == 3:
-    #     trajectories_axis = trajectories_figure.add_subplot(projection="3d")
-    #     trajectories_axis.plot(*train_trajectory.T, lw=0.5, color=trajectories_colors[0],
-    #                             label=trajectories_labels[0])
-    #     for index, test_trajectory in enumerate(test_trajectories):
-    #         trajectories_axis.plot(*test_trajectory.T, lw=0.5,
-    #                                 color=trajectories_colors[index + 1],
-    #                                 label=trajectories_labels[index + 1])
-    # else:
-    #     trajectories_axis = trajectories_figure.add_subplot()
-    #     trajectories_axis.plot(train_trajectory, lw=0.5, color=trajectories_colors[0],
-    #                             label=trajectories_labels[0])
-    #     for index, test_trajectory in enumerate(test_trajectories):
-    #         trajectories_axis.plot(test_trajectory, lw=0.5,
-    #                                 color=trajectories_colors[index + 1],
-    #                                 label=trajectories_labels[index + 1])
-    # trajectories_axis.set_title(f"{system_name} train / test trajectories")
-    # trajectories_axis.legend()
-    # trajectories_figure.tight_layout()
-    # trajectories_figure.savefig(
-    #     Path(save_fig_path).with_name(f"{system_name}_trajectories.png")
-    # )
-    # plt.close(trajectories_figure)
+    assert np.isnan(train_trajectory).any() == False
+    assert np.isnan(test_trajectories).any() == False
+
 
     print("Training ")
 
@@ -338,3 +349,4 @@ def run_dysts(system_name, save_fig_path, device=None, seed=0):
         "predictions": predictions,
         "metrics": metrics,
     }
+
