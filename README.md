@@ -51,7 +51,7 @@ poetry config virtualenvs.in-project true --local
 
 ```bash
 python3 -m venv {your_env_name}
-source env_emulator_climatem/bin/activate
+source {your_env_name}/bin/activate
 poetry install
 ```
 
