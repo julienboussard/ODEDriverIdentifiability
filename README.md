@@ -73,7 +73,21 @@ poetry install
 - [Leaderboard](https://kausable.github.io/CausalDynamics/leaderboard.html)
 
 ## Citation
-If you find any of the code and dataset useful, feel free to acknowledge our work through:
+If you find any of the code and dataset useful, feel free to acknowledge our work through 
+
+```bibtex
+@misc{boussard2026identifiabilityguaranteesdriversdynamics,
+      title={Identifiability Guarantees for Drivers and Dynamics of Delayed Physical Systems}, 
+      author={Julien Boussard and Antoine Debouchage and Théo Saulus},
+      year={2026},
+      eprint={2609.37944},
+      archivePrefix={arXiv},
+      primaryClass={stat.ML},
+      url={https://arxiv.org/abs/2609.37944}, 
+}
+```
+
+And the CausalDynamics work through:
 
 ```bibtex
 @article{herdeanu2025causaldynamics,
