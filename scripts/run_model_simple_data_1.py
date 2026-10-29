@@ -12,23 +12,23 @@ warnings.filterwarnings('ignore')
 
 import matplotlib.pyplot as plt 
 
-from causaldynamics.baselines import StructuredODEDiscovery
+from causaldynamics.baselines import StructuredODEDiscovery, StructuredODEDiscoveryAGL
 
 
 tau_max = 1 # i.e. no delay 
 hyperparam_search_array = np.array([0.0001, 0.0005, 0.001])
-model_name = "ode_sparse_discovery"
+model_name = "ode_sparse_discovery_l0_nobn2d"
 
 # Hyperparameters to do search over: lambda_m only?
 # Then save the plot inside each folder and report the best hyperparameter for each noise/confounder setting.
 
 if __name__ == "__main__":
 
-    assert torch.cuda.is_available()
+    # assert torch.cuda.is_available()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    assert device.type == "cuda", "CUDA is not available. Please check your PyTorch installation and GPU configuration."
+    # assert device.type == "cuda", "CUDA is not available. Please check your PyTorch installation and GPU configuration."
 
     for noise in [0.00, 2.00]:
         for confounder in [False, True]:
@@ -155,6 +155,16 @@ if __name__ == "__main__":
                         print(f"Skipping timeseries {j} due to NaN values")
                         continue
                     bool_nonans = True
+                    # lowrank_model = StructuredODEDiscoveryAGL(
+                    #     coupled=False,
+                    #     t = tau_max,
+                    #     n = N,
+                    #     hidden_dim = 8, 
+                    #     n_layers = 2,
+                    #     device = device,
+                    #     normalize_grad = True,
+                    # )
+                    # trained_model, mask = lowrank_model.run(lambda_grad=0, X=torch.tensor(x).to(device), lambda_init = 0., lambda_m = 0.05, lr=0.001, n_inner_min_sparse = 50, batch_size=128, n_inner=1_000, patience = 1000, save_fig_path="agl_loss.png")
                     lowrank_model = StructuredODEDiscovery(
                         coupled=False,
                         t = tau_max,
@@ -170,14 +180,15 @@ if __name__ == "__main__":
                         annealing_epochs = 10,
                         normalize_grad = True,
                     )
-                    trained_model, mask = lowrank_model.run(n_samples=3, lambda_grad=100, X=torch.tensor(x).to(device), l0_l1_l2='l0', th=0.5, lr=0.001, lambda_m = 0.025, n_inner_min_sparse = 100, batch_size=128, n_inner=4_000, patience = 200, save_fig_path="couple_005_loss.png")
+                    trained_model, mask = lowrank_model.run(n_samples=3, lambda_grad=100, X=torch.tensor(x).to(device), l0_l1_l2='l0', th=0.5, lr=0.001, lambda_m = 0.025, n_inner_min_sparse = 100, batch_size=128, n_inner=2_000, patience = 200, save_fig_path="couple_005_loss.png")
                     lowrank_adj_matrix.append(mask.detach().cpu().numpy())
 
                 if bool_nonans:
                     results_scores = score(
                         preds= np.array(lowrank_adj_matrix)[:, 0], #.transpose((0, 2, 1)), # Need to transpose
                         labs= adj_matrix,
-                        name=model_name
+                        name=model_name,
+                        shd_threshold=1e-8,
                     )
 
                     results_dict = {}

@@ -159,17 +159,19 @@ def subsample(t, state, interval_days, dt):
 
 
 if __name__ == "__main__":
-    # quick demo: 50 years, daily integration, subsampled to monthly
-    t, state = simulate_unified_oscillator(n_days=100 * 365, dt=1.0, seed=0, noise_std=0.25)
-    t_m, state_m = subsample(t, state, interval_days=30, dt=1.0)
 
-    labels = ["T1 (Nino-3 SST, degC)", "h (Nino-6 thermocline, m)",
-              "tau1 (Nino-4 wind stress)", "tau2 (Nino-5 wind stress)"]
-    print(f"Daily series: {state.shape}, monthly-subsampled: {state_m.shape}")
-    for lab, row in zip(labels, state_m):
-        print(f"{lab}: min={row.min():.3g}, max={row.max():.3g}")
+    for noise_level, name_noise in zip([0.0, 0.05, 0.1, 0.25, 0.5], ["0", "005", "01", "025", "05"]):
+        # quick demo: 50 years, daily integration, subsampled to monthly
+        t, state = simulate_unified_oscillator(n_days=200 * 365, dt=1.0, seed=0, noise_std=noise_level) # 200 years, 100 train, 100 test
+        t_m, state_m = subsample(t, state, interval_days=30, dt=1.0)
 
-    np.save("wang_oscillator_daily.npy", state)    
-    np.save("wang_oscillator_monthly.npy", state_m)
-    np.save("wang_oscillator_daily_time.npy", t)    
-    np.save("wang_oscillator_monthly_time.npy", t_m)
+        labels = ["T1 (Nino-3 SST, degC)", "h (Nino-6 thermocline, m)",
+                "tau1 (Nino-4 wind stress)", "tau2 (Nino-5 wind stress)"]
+        print(f"Daily series: {state.shape}, monthly-subsampled: {state_m.shape}")
+        for lab, row in zip(labels, state_m):
+            print(f"{lab}: min={row.min():.3g}, max={row.max():.3g}")
+
+        np.save(f"wang_oscillator_daily_{name_noise}.npy", state)    
+        np.save(f"wang_oscillator_monthly_{name_noise}.npy", state_m)
+        np.save(f"wang_oscillator_daily_time_{name_noise}.npy", t)    
+        np.save(f"wang_oscillator_monthly_time_{name_noise}.npy", t_m)

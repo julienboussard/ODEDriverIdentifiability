@@ -8,7 +8,7 @@ Predicts the last timestep from a window of T timesteps:
 where
     X  : (T, N)     input window  (full history)
 
-Unlike ode_discovery_gs.py, there is no learned soft mask M — every input
+Unlike ode_discovery_l0.py, there is no learned soft mask M — every input
 (t, n) pair is passed to every output subnetwork f[i]. Structural sparsity
 (which lagged variables drive which output) is instead recovered by an
 adaptive group lasso proximal step applied to the columns of each f[i]'s

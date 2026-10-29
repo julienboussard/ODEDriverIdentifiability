@@ -12,12 +12,11 @@ warnings.filterwarnings('ignore')
 
 import matplotlib.pyplot as plt 
 
-from causaldynamics.baselines import StructuredODEDiscovery
-
+from causaldynamics.baselines import StructuredODEDiscovery, StructuredODEDiscoveryAGL
 
 tau_max = 1 # i.e. no delay 
-hyperparam_search_array = np.array([0.0001, 0.0005, 0.001, 0.005, 0.01])
-model_name = "ode_sparse_discovery"
+model_name = "ode_sparse_discovery_l1"
+shd_threshold = 1e-8
 
 # Hyperparameters to do search over: lambda_m only?
 # Then save the plot inside each folder and report the best hyperparameter for each noise/confounder setting.
@@ -157,6 +156,16 @@ if __name__ == "__main__":
                                 print(f"Skipping timeseries {j} due to NaN values")
                                 continue
                             bool_nonans = True
+                            # lowrank_model = StructuredODEDiscoveryAGL(
+                            #     coupled=False,
+                            #     t = tau_max,
+                            #     n = N,
+                            #     hidden_dim = 8, 
+                            #     n_layers = 2,
+                            #     device = device,
+                            #     normalize_grad = True,
+                            # )
+                            # trained_model, mask = lowrank_model.run(lambda_grad=0, X=torch.tensor(x).to(device), lambda_init = 0., lambda_m = 0.05, lr=0.001, n_inner_min_sparse = 50, batch_size=128, n_inner=1_000, patience = 1000, save_fig_path="agl_loss.png")
                             lowrank_model = StructuredODEDiscovery(
                                 coupled=False,
                                 t = tau_max,
@@ -172,13 +181,12 @@ if __name__ == "__main__":
                                 annealing_epochs = 10,
                                 normalize_grad = True,
                             )
-                            trained_model, mask = lowrank_model.run(n_samples=3, lambda_grad=100, X=torch.tensor(x).to(device), l0_l1_l2='l0', th=0.5, lr=0.001, lambda_m = 0.025, n_inner_min_sparse = 100, batch_size=128, n_inner=4_000, patience = 200, save_fig_path="coupled_timelag_loss.png")
+                            trained_model, mask = lowrank_model.run(n_samples=3, lambda_grad=100, X=torch.tensor(x).to(device), l0_l1_l2='l1', th=0.5, lr=0.001, lambda_m = 50., n_inner_min_sparse = 100, batch_size=128, n_inner=2_000, patience = 200, save_fig_path="couple_005_loss.png")
                             mask_numpy = mask.detach().cpu().numpy()
-
                             #For time lag evaluation
                             mask_numpy = mask_numpy.max(0)[None]
 
-                            vec = (mask_numpy > 0.5).sum(1) == 0
+                            vec = (mask_numpy > shd_threshold).sum(1) == 0
                             if np.any(vec):
                                 idx = np.flatnonzero(vec)
                                 mask_numpy[0, idx, idx] = 1
@@ -189,7 +197,8 @@ if __name__ == "__main__":
                             results_scores = score(
                                 preds= np.array(lowrank_adj_matrix)[:, 0], #.transpose((0, 2, 1)), # Need to transpose
                                 labs= adj_matrix,
-                                name=model_name
+                                name=model_name,
+                                shd_threshold=shd_threshold
                             )
 
                             results_dict = {}
